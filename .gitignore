@@ -1,9 +1,9 @@
-./check_mp3.py
-./Music Info.csv.zip
-./unmatched_songs.csv
-./wrong_name.py
+check_mp3.py
+Music Info.csv.zip
+unmatched_songs.csv
+wrong_name.py
 downloads/*
 comparisons/*
 .venv/
 **/__pycache__/**
-./notes.txxt
+notes.txxt
