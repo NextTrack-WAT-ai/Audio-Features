@@ -2,6 +2,9 @@
 
 This project compares the output of a custom audio feature extraction algorithm with Spotify’s official features, using a dataset of music tracks. It helps evaluate how close the custom model is to Spotify’s ground truth and highlights areas of strength and improvement.
 
+The algorithm to extract audio feature is specifically located in the extract_feature function in soundcloud_pipeline.py
+
+
 🔩 Infra
 
 ✅ soundcloud_pipeline.py

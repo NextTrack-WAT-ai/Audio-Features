@@ -7,3 +7,4 @@ comparisons/*
 .venv/
 **/__pycache__/**
 notes.txxt
+.DS_Store
