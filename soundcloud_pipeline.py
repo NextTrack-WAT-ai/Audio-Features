@@ -22,6 +22,7 @@ import librosa
 import numpy as np
 from scipy import stats
 import warnings
+from scipy.optimize import differential_evolution
 
 # --- Configuration ---
 DOWNLOAD_FOLDER = Path("downloads")
@@ -29,6 +30,7 @@ CHECKPOINT_FILE = DOWNLOAD_FOLDER / "song_url.json"
 COMPARISONS_FOLDER = Path("comparisons")
 SOUNDCLOUD_SEARCH_URL = "https://soundcloud.com/search?q={query}"
 FEATURE_CACHE = "./audio_features_cache.csv"
+SPOTIFY_BASELINE = "music_info_cleaned.csv"
 
 REQUEST_TIMEOUT = 15  # seconds for HTTP requests
 SELENIUM_TIMEOUT = 30 # Increased timeout seconds for Selenium waits
@@ -51,82 +53,46 @@ def sanitize_filename(filename):
     # sanitized = sanitized[:max_len]
     return sanitized
 
+def normalize(s):
+    return re.sub(r'\W+', '', s).strip().lower()
 
-def compare_results(results, song_name, artist_name):
-    # Load Spotify data from CSV
-    spotify_data = pd.read_csv('./music_info_cleaned.csv')
+# def compare_results(your_feats, spotify_feats, song, artist):
+#     features = [
+#         'danceability', 'energy', 'acousticness', 'instrumentalness',
+#         'liveness', 'valence', 'speechiness', 'tempo', 'loudness', 'key'
+#     ]
 
-    spotify_song = spotify_data[(spotify_data['name'].str.lower() == song_name.lower()) & (spotify_data['artist'].str.lower() == artist_name.lower())]
-    
-    if len(spotify_song) == 0:
-        logging.info(f"THIS DIDNOT WORKOUT: {artist_name} {song_name}")
-        return
+#     your_vals = [your_feats[f] for f in features]
+#     spotify_vals = [spotify_feats[f] for f in features]
 
-    spotify_song = spotify_song.iloc[0]
+#     comp_df = pd.DataFrame({
+#         'Feature': features,
+#         'Your Algorithm': your_vals,
+#         'Spotify': spotify_vals
+#     })
+#     comp_df['Difference'] = comp_df['Your Algorithm'] - comp_df['Spotify']
 
-    base_filename = f"comparison_{spotify_song['name']}_by_{spotify_song['artist']}.csv"
-    
-    #check if the comparison exist already
-    if base_filename in os.listdir(COMPARISONS_FOLDER):
-        logging.info("The song has already been compared, skipping...")
-        return
+#     # key error score row
+#     predicted_key = feats['key']
+#     spotify_key = int(obs['key'])
+#     key_dist = abs(predicted_key - spotify_key) % 12
+#     key_error_score = min(key_dist, 12 - key_dist) / 6.0
+#     extra = pd.DataFrame([{
+#         'Feature': 'key_error_score',
+#         'Your Algorithm': key_error_score,
+#         'Spotify': None,
+#         'Difference': None
+#     }])
+#     comparison = pd.concat([comp_df, extra], ignore_index=True)
 
-    
-
-    
-
-    logging.info("we got the spotify song, creating comparison dataframe now:\n"+ str(spotify_song))
-    
-    # Calculate key error score
-    predicted_key = results['key']
-    spotify_key = spotify_song['key']
-    key_distance = abs(predicted_key - spotify_key) % 12
-    key_error_score = min(key_distance, 12 - key_distance) / 6.0  # Normalize to [0, 1]
-
-    
-    # Create comparison dataframe
-    comparison = pd.DataFrame({
-        'Feature': ['danceability', 'energy', 'acousticness', 'instrumentalness', 
-                    'liveness', 'valence', 'speechiness', 'tempo', 'loudness', 'key'],
-        'Your Algorithm': [results['danceability'], results['energy'], results['acousticness'],
-                        results['instrumentalness'], results['liveness'], results['valence'],
-                        results['speechiness'], results['tempo'], results['loudness'], results['key']],
-        'Spotify': [spotify_song['danceability'], spotify_song['energy'], spotify_song['acousticness'],
-                spotify_song['instrumentalness'], spotify_song['liveness'], spotify_song['valence'],
-                spotify_song['speechiness'], spotify_song['tempo'], spotify_song['loudness'], spotify_song['key']]
-    })
-
-    # Calculate difference
-    comparison['Difference'] = comparison['Your Algorithm'] - comparison['Spotify']
-
-    # Add key error score as a separate row
-    comparison = pd.concat([
-        comparison,
-        pd.DataFrame([{
-            'Feature': 'key_error_score',
-            'Your Algorithm': key_error_score,
-            'Spotify': None,
-            'Difference': None
-        }])
-    ], ignore_index=True)
-
-    # Print the table
-    logging.info(f"Comparison for: {spotify_song['name']} by {spotify_song['artist']}")
-    logging.info(comparison.to_string(index=False))
-    output_path = COMPARISONS_FOLDER / base_filename
-
-    try:
-        # Ensure the comparisons directory exists
-        COMPARISONS_FOLDER.mkdir(parents=True, exist_ok=True) 
-        # Save to the comparisons folder
-        comparison.to_csv(output_path, index=False)
-        logging.info(f"Comparison saved to: {output_path}")
-    except OSError as e:
-        # Handle potential errors during directory creation or file writing
-        logging.error(f"Error creating directory or saving file {output_path}: {e}")
-    except Exception as e:
-        # Handle other unexpected errors during save
-        logging.error(f"An unexpected error occurred while saving comparison CSV {output_path}: {e}")
+#     # save and log
+#     base_filename = f"comparison_{title}_by_{artist}.csv"
+#     output_path = COMPARISONS_FOLDER / base_filename
+#     try:
+#         comparison.to_csv(output_path, index=False)
+#         logging.info(f"Comparison saved to: {output_path}")
+#     except Exception as e:
+#         logging.error(f"Error saving comparison for {title} by {artist}: {e}")
 
 # --- Core Classes ---
 class SoundCloudScraper:
@@ -138,6 +104,10 @@ class SoundCloudScraper:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
+        self.BANNED_KEYWORDS = [
+            "remastered", "live", "album version", "mono", "slowed", 
+            "reverb", "edit", "clean", "explicit", "version"
+        ]
 
     def _setup_driver(self):
         """Initializes the Selenium WebDriver for this scraper instance."""
@@ -294,6 +264,9 @@ class SoundCloudScraper:
         logging.info(f"Filtering {len(search_results)} results for '{target_song}' by '{target_artist}'")
 
         for result in search_results:
+            if result['title'] in self.BANNED_KEYWORDS or result['artist'] in self.BANNED_KEYWORDS:
+                continue
+                
             if result['title'] == target_song and result['artist'] == target_artist:
                 logging.info(f"Found exact match: '{result['title']}' by '{result['artist']}'")
                 return result
@@ -335,7 +308,6 @@ class SoundCloudScraper:
                             f"(Highest score: {highest_score:.2f}, Threshold: {MATCH_THRESHOLD})")
             return None
 
-
 # --- New YTDLPDownloader Class ---
 class YTDLPDownloader:
     """Handles downloading audio tracks using the yt-dlp library."""
@@ -343,7 +315,7 @@ class YTDLPDownloader:
     def __init__(self, download_folder):
         self.download_folder = Path(download_folder)
 
-    def download_track(self, url, expected_artist, expected_title):
+    def download_track(self, url, expected_artist, expected_title, output_path=None):
         """Downloads a single track from the given URL using yt-dlp."""
         
         logging.info(f"Processing download for URL: {url}")
@@ -415,6 +387,10 @@ class YTDLPDownloader:
                 # 'cookiefile': 'path/to/your/cookies.txt',
             }
             
+            # If output_path is provided, use it for yt-dlp's outtmpl
+            if output_path is not None:
+                ydl_opts_download['outtmpl'] = str(Path(output_path).with_suffix('.%(ext)s'))
+            
             logging.info(f"Attempting download via yt-dlp with options: {ydl_opts_download}")
             with yt_dlp.YoutubeDL(ydl_opts_download) as ydl_download:
                 ydl_download.download([url])
@@ -442,433 +418,182 @@ class YTDLPDownloader:
             
         return final_filename, download_successful
 
-class SpotifyFeaturesClone:
-    def __init__(self):
-        """Initialize the audio analysis pipeline."""
-        self.sample_rate = 22050  # Librosa's default sample rate
-        warnings.filterwarnings('ignore')  # Suppress librosa warnings
-        
-    def load_audio(self, file_path):
-        """Load and prepare audio file for analysis."""
-        # Load with a small duration for fast feature estimation if needed
-        y, sr = librosa.load(file_path, sr=self.sample_rate)
-        return y
+class SpotifyFeaturesTunable:
     
-    def extract_features(self, audio):
-        """Extract Spotify-like audio features from the loaded audio."""
-        features = {}
-        
-        # === Rhythm features ===
-        # Tempo and beat tracking with multi-band onset detection for more accuracy
-        # Use harmonic/percussive source separation to improve beat detection
-        y_harmonic, y_percussive = librosa.effects.hpss(audio)
-        
-        # Get onset envelope from percussive component for better beat detection
-        onset_env = librosa.onset.onset_strength(
-            y=y_percussive, 
-            sr=self.sample_rate,
-            aggregate=np.median  # More robust aggregation
-        )
-        
-        # Enhanced tempo detection with fallback
-        tempo, beat_frames = librosa.beat.beat_track(
-            onset_envelope=onset_env, 
-            sr=self.sample_rate,
-            start_bpm=120,
-            tightness=100
-        )
+    def __init__(
+        self,
+        sample_rate: int = 22050,
+        tempo_range: tuple = (60.0, 180.0),
+        weights: dict = None
+    ):
+        self.sample_rate = sample_rate
+        self.tempo_min, self.tempo_max = tempo_range
+        warnings.filterwarnings('ignore')
+        logging.basicConfig(level=logging.INFO)
 
-        # Clamp to a musically realistic range
-        if tempo < 60 or tempo > 180:
-            # Fallback to global tempo estimation
-            fallback = librosa.beat.tempo(onset_envelope=onset_env, sr=self.sample_rate)
-            if len(fallback) > 0:
-                tempo = fallback[0]
+        # Default tunable weights
+        default = {
+            'danceability':     {'beat_reg': 0.4, 'bass': 0.3, 'pulse': 0.3},
+            'energy':           {'rms': 0.6, 'entropy': 0.2, 'dyn_range': 0.2},
+            'acousticness':     {'harmonic_ratio': 0.4, 'centroid': 0.3, 'flatness': 0.2, 'contrast': 0.1},
+            'valence':          {'mode': 0.3, 'energy': 0.2, 'tempo': 0.2, 'brightness': 0.15, 'rhythm': 0.15},
+            'instrumentalness': {'mfcc_var': 0.6, 'pitch_var': 0.4},
+            'speechiness':      {'zcr': 0.4, 'rhythm': 0.3, 'mfcc': 0.3},
+            'liveness':         {'dyn_range': 0.4, 'high_freq': 0.3, 'decay': 0.3},
+            'tempo':            {'scale': 1.0},
+            'loudness':         {'scale': 1.0},
+            'key':              {'weight': 1.0}
+        }
+        self.weights = weights or default
 
-        # Final clamping just to be sure
-        tempo = max(60.0, min(180.0, tempo))
-        features['tempo'] = float(tempo)
-        
-        # Improved danceability based on:
-        # 1. Rhythm regularity (consistency of beat intervals)
-        # 2. Low-frequency energy (bass presence)
-        # 3. Pulse clarity
-        
-        # Get beat times and calculate regularity
-        beat_times = librosa.frames_to_time(beat_frames, sr=self.sample_rate)
-        if len(beat_times) > 1:
-            beat_intervals = np.diff(beat_times)
-            # Higher value = more consistent beat (important for danceability)
-            beat_regularity = 1.0 - min(1.0, np.std(beat_intervals) / np.mean(beat_intervals))
-        else:
-            beat_regularity = 0.0
-            
-        # Measure bass energy (important for dance music)
-        spec = np.abs(librosa.stft(audio))
-        freqs = librosa.fft_frequencies(sr=self.sample_rate)
-        bass_mask = freqs <= 250  # Bass frequencies
-        bass_energy = np.mean(spec[bass_mask]) / (np.mean(spec) + 1e-8)
-        
-        # Pulse clarity from onset strength
-        pulse_clarity = librosa.feature.rms(y=y_percussive)[0].mean()
-        
-        # Combine factors with appropriate weights
-        danceability_raw = (0.4 * beat_regularity + 
-                           0.3 * bass_energy +
-                           0.3 * self._normalize(pulse_clarity, 0, 0.2, 0, 1))
-        features['danceability'] = min(1.0, max(0.0, danceability_raw))
-        
-        # === Energy-related features ===
-        # Improved energy measure considering:
-        # 1. RMS energy
-        # 2. Spectral entropy (higher = more "busy" signal)
-        # 3. Dynamic range
-        
-        # RMS energy
-        rms = librosa.feature.rms(y=audio)[0]
-        
-        # Spectral entropy - measure of "chaos" in the signal
-        stft = np.abs(librosa.stft(audio))
-        stft_normalized = stft / (np.sum(stft, axis=0, keepdims=True) + 1e-8)
-        spectral_entropy = -np.sum(stft_normalized * np.log2(stft_normalized + 1e-8), axis=0).mean()
-        spectral_entropy_norm = self._normalize(spectral_entropy, 0, 5, 0, 1)
-        
-        # Dynamic range compression measure
-        dynamic_range = np.percentile(rms, 95) / (np.percentile(rms, 10) + 1e-8)
-        dynamic_range_norm = self._normalize(dynamic_range, 1, 20, 0, 1)
-        
-        # Combined energy feature
-        energy_raw = 0.6 * self._normalize(np.mean(rms), 0, 0.2, 0, 1) + \
-                    0.2 * spectral_entropy_norm + \
-                    0.2 * dynamic_range_norm
-        features['energy'] = min(1.0, max(0.0, energy_raw))
-        
-        # === Timbre & Spectral features ===
-        # Improved spectral features
-        centroid = librosa.feature.spectral_centroid(y=audio, sr=self.sample_rate)[0]
-        bandwidth = librosa.feature.spectral_bandwidth(y=audio, sr=self.sample_rate)[0]
-        contrast = librosa.feature.spectral_contrast(y=audio, sr=self.sample_rate)
-        flatness = librosa.feature.spectral_flatness(y=audio)
-        
-        # Acousticness (improved): acoustic tracks have:
-        # 1. Lower spectral centroid
-        # 2. Lower spectral entropy
-        # 3. Higher contrast between bands (less flat spectrum)
-        # 4. Less percussive content
-        
-        # Ratio of harmonic to percussive energy
-        harmonic_energy = np.mean(librosa.feature.rms(y=y_harmonic)[0])
-        percussive_energy = np.mean(librosa.feature.rms(y=y_percussive)[0])
-        harmonic_ratio = harmonic_energy / (percussive_energy + harmonic_energy + 1e-8)
-        
-        # Spectral flatness (electronic music tends to have flatter spectra)
-        flatness_mean = np.mean(flatness)
-        
-        # Contrast between low and high frequency bands
-        if contrast.shape[0] >= 6:  # Ensure we have enough contrast bands
-            high_freq_energy = np.mean(contrast[-2:])  # Higher frequency bands
-            low_freq_energy = np.mean(contrast[:2])    # Lower frequency bands
-            contrast_ratio = low_freq_energy / (high_freq_energy + 1e-8)
-        else:
-            contrast_ratio = 0.5
-        
-        # Combine into acousticness score
-        acousticness_raw = 0.4 * harmonic_ratio + \
-                          0.3 * (1.0 - self._normalize(np.mean(centroid), 500, 3000, 0, 1)) + \
-                          0.2 * (1.0 - flatness_mean) + \
-                          0.1 * self._normalize(contrast_ratio, 0.5, 5, 0, 1)
-                          
-        features['acousticness'] = min(1.0, max(0.0, acousticness_raw))
-        
-        # === Key and mode detection (improved) ===
-        # Using more robust key detection with CREMA and chroma features
-        chroma_cqt = librosa.feature.chroma_cqt(
-            y=y_harmonic,  # Use harmonic component for better key detection
-            sr=self.sample_rate, 
-            bins_per_octave=36,  # Higher resolution
-            n_chroma=12
-        )
-        
-        # Smooth the chroma to get a better key estimate
-        chroma_smooth = np.minimum(1.0, librosa.decompose.nn_filter(
-            chroma_cqt,
-            aggregate=np.median,
-            metric='cosine'
-        ))
-        
-        # Sum over time to get key profile
-        chroma_sum = np.sum(chroma_smooth, axis=1)
-        
-        # Key profiles for major and minor keys (Krumhansl-Kessler profiles)
-        major_profile = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-        minor_profile = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-        
-        # Normalize profiles
-        major_profile = major_profile / major_profile.sum()
-        minor_profile = minor_profile / minor_profile.sum()
-        chroma_sum = chroma_sum / chroma_sum.sum()
-        
-        # Calculate correlation manually to avoid np.corrcoef issues
-        def manual_correlation(a, b):
-            # Make sure inputs are numpy arrays
-            a = np.array(a, dtype=float)
-            b = np.array(b, dtype=float)
-            
-            # Calculate mean of each array
-            a_mean = np.mean(a)
-            b_mean = np.mean(b)
-            
-            # Calculate numerator (covariance)
-            numerator = np.sum((a - a_mean) * (b - b_mean))
-            
-            # Calculate denominator (product of standard deviations)
-            a_std = np.sqrt(np.sum((a - a_mean) ** 2))
-            b_std = np.sqrt(np.sum((b - b_mean) ** 2))
-            denominator = a_std * b_std
-            
-            # Handle division by zero
-            if denominator == 0:
-                return 0
-            
-            # Return Pearson correlation coefficient
-            return numerator / denominator
-        
-        # Calculate correlation for all possible keys
-        correlations_major = np.zeros(12)
-        correlations_minor = np.zeros(12)
-        
-        for i in range(12):
-            rolled_major = np.roll(major_profile, i)
-            rolled_minor = np.roll(minor_profile, i)
-            
-            # Calculate correlations using our manual function
-            correlations_major[i] = manual_correlation(chroma_sum, rolled_major)
-            correlations_minor[i] = manual_correlation(chroma_sum, rolled_minor)
-        
-        # Find the best key and mode
-        key_major = np.argmax(correlations_major)
-        key_minor = np.argmax(correlations_minor)
-        
-        if np.max(correlations_major) > np.max(correlations_minor):
-            key = int(key_major)
-            mode = 1  # Major
-            key_confidence = float(np.max(correlations_major))
-        else:
-            key = int(key_minor)
-            mode = 0  # Minor
-            key_confidence = float(np.max(correlations_minor))
-        
-        features['key'] = key
-        features['mode'] = mode
-        features['key_confidence'] = key_confidence
-        
-        # === Valence (musical positiveness) - improved ===
-        # Factors that contribute to valence:
-        # 1. Mode (major/minor)
-        # 2. Tempo
-        # 3. Energy
-        # 4. Spectral characteristics (brightness)
-        
-        # Mode factor
-        mode_factor = 0.7 if mode == 1 else 0.3
-        
-        # Tempo factor - higher tempos usually indicate higher valence
-        tempo_factor = self._normalize(tempo, 60, 180, 0, 1)
-        
-        # Timbral brightness - brighter sounds often indicate higher valence
-        brightness = self._normalize(np.mean(centroid), 500, 3000, 0, 1)
-        
-        # Rhythm strength - stronger rhythm often means higher valence
-        rhythm_strength = self._normalize(np.mean(onset_env), 0, 0.5, 0, 1)
-        
-        # Combine factors for valence
-        valence_raw = 0.3 * mode_factor + \
-                     0.2 * features['energy'] + \
-                     0.2 * tempo_factor + \
-                     0.15 * brightness + \
-                     0.15 * rhythm_strength
-                     
-        features['valence'] = min(1.0, max(0.0, valence_raw))
-        
-        # === Loudness (improved) ===
-        # Calculate perceived loudness using multiple bands and considering perceptual weighting
-        
-        # More accurate loudness calculation with A-weighting (to match human perception)
-        # First convert RMS to dB
-        rms_db = librosa.amplitude_to_db(rms, ref=1.0)
-        
-        # Apply perceptual weighting - mid frequencies contribute more to perceived loudness
-        spec_band = librosa.stft(audio)
-        freqs = librosa.fft_frequencies(sr=self.sample_rate)
-        
-        # Simplified A-weighting
-        a_weighting = np.zeros_like(freqs)
-        for i, f in enumerate(freqs):
-            # Approximate A-weighting curve
-            if f < 20:
-                a_weighting[i] = -70
-            elif f < 100:
-                a_weighting[i] = -20 * np.log10(100 / f)
-            elif f < 1000:
-                a_weighting[i] = 0
-            elif f < 10000:
-                a_weighting[i] = 2
-            else:
-                a_weighting[i] = -20 * np.log10(f / 10000)
-        
-        # Apply weighting to spectrogram
-        weighted_spec = np.abs(spec_band) * np.reshape(10**(a_weighting/20), (-1, 1))
-        
-        # Compute weighted loudness
-        weighted_loudness = librosa.amplitude_to_db(np.mean(np.mean(weighted_spec, axis=1)))
-        features['loudness'] = float(max(-60, min(0, weighted_loudness)))
-        
-        # === Instrumentalness (improved) ===
-        # Better vocal detection using multiple factors:
-        # 1. MFCCs (vocal range)
-        # 2. Spectral flatness (vocals tend to have less flat spectrum)
-        # 3. Pitch variation (vocals have more pitch variation)
-        
-        # Extract MFCCs for vocal detection
-        mfccs = librosa.feature.mfcc(y=audio, sr=self.sample_rate, n_mfcc=20)
-        
-        # Focus on MFCCs associated with vocals (typically 2-8)
-        vocal_mfccs = mfccs[2:8, :]
-        
-        # Vocals typically have higher variance in these MFCCs
-        vocal_var = np.var(vocal_mfccs, axis=1).mean()
-        
-        # Pitch variation - higher for vocals
-        pitches, magnitudes = librosa.piptrack(y=audio, sr=self.sample_rate)
-        pitch_variation = 0
-        if magnitudes.max() > 0:  # Only if we detect pitches
-            # For each frame, find the highest magnitude pitch
-            pitch_max_indices = np.argmax(magnitudes, axis=0)
-            pitches_max = np.array([pitches[pitch_max_indices[i], i] for i in range(magnitudes.shape[1])])
-            pitches_max = pitches_max[pitches_max > 0]  # Only consider frames with detected pitch
-            if len(pitches_max) > 0:
-                # Calculate variation in the detected pitches
-                pitch_variation = np.std(pitches_max) / (np.mean(pitches_max) + 1e-8)
-        
-        # Combine factors - higher values mean less vocal content
-        instrumental_raw = 1.0 - (0.6 * self._normalize(vocal_var, 0.1, 5, 0, 1) + 
-                               0.4 * self._normalize(pitch_variation, 0, 0.5, 0, 1))
-        
-        features['instrumentalness'] = min(1.0, max(0.0, instrumental_raw))
-        
-        # === Speechiness (improved) ===
-        # Better speech detection using:
-        # 1. Zero crossing rate (higher for speech)
-        # 2. Rhythm regularity (lower for speech)
-        # 3. Spectral shape (speech has specific formant patterns)
-        
-        # Zero crossing rate (speech has higher values)
-        zcr = librosa.feature.zero_crossing_rate(audio)[0]
-        zcr_mean = np.mean(zcr)
-        
-        # Speech has specific rhythm patterns - less regular than music
-        if len(beat_times) > 1:
-            rhythm_regularity = 1.0 - beat_regularity  # Invert - speech has less regular rhythm
-        else:
-            rhythm_regularity = 0.5  # Default mid-value
-            
-        # Spectral shape for speech detection
-        # Speech tends to have specific spectral patterns due to formants
-        spectral_rolloff = librosa.feature.spectral_rolloff(y=audio, sr=self.sample_rate)[0]
-        rolloff_mean = np.mean(spectral_rolloff)
-        
-        # MFCC pattern correlation with speech
-        # Mean and variance of MFCCs are often used to detect speech
-        mfcc_deltas = librosa.feature.delta(mfccs)
-        mfcc_var = np.var(mfcc_deltas, axis=1).mean()
-        
-        # Combine factors for speechiness
-        speechiness_raw = 0.4 * self._normalize(zcr_mean, 0.05, 0.15, 0, 1) + \
-                         0.3 * rhythm_regularity + \
-                         0.3 * self._normalize(mfcc_var, 0.5, 5, 0, 1)
-                         
-        features['speechiness'] = min(1.0, max(0.0, speechiness_raw))
-        
-        # === Liveness (improved) ===
-        # Better live detection using:
-        # 1. Audio dynamics (live recordings have more dynamic variation)
-        # 2. Spectral features (crowd noise, room acoustics)
-        # 3. Reverb estimation
-        
-        # Dynamic range in live recordings
-        percentile_diff = np.percentile(rms, 95) - np.percentile(rms, 10)
-        dynamic_range = self._normalize(percentile_diff, 0.01, 0.1, 0, 1)
-        
-        # Spectral shape for audience noise detection
-        # Live recordings often have more energy in higher frequencies (applause, crowd)
-        rolloff_high = np.percentile(spectral_rolloff, 90)
-        high_freq_content = self._normalize(rolloff_high, 3000, 8000, 0, 1)
-        
-        # Reverb estimation - live recordings typically have more reverb
-        # Use decay time from impulse response
-        y_harmonic = librosa.effects.harmonic(audio)
-        decay_envelope = librosa.onset.onset_strength(y=y_harmonic, sr=self.sample_rate)
-        decay_time = 0
-        if len(decay_envelope) > 1:
-            # Estimate decay time using envelope
-            decay_segments = librosa.util.frame(decay_envelope, frame_length=10, hop_length=1)
-            if decay_segments.shape[1] > 0:
-                segment_means = np.mean(decay_segments, axis=0)
-                if len(segment_means) > 1:
-                    # Calculate slope of decay
-                    indices = np.arange(len(segment_means))
-                    slope, _, _, _, _ = stats.linregress(indices, segment_means)
-                    # Negative slope indicates decay - steeper is less reverb
-                    decay_time = self._normalize(abs(slope), 0.001, 0.1, 0, 1)
-                    # Invert so higher value = more reverb
-                    decay_time = 1 - decay_time
-        
-        # Combine factors for liveness score
-        liveness_raw = 0.4 * dynamic_range + \
-                      0.3 * high_freq_content + \
-                      0.3 * decay_time
-                      
-        features['liveness'] = min(1.0, max(0.0, liveness_raw))
-        
-        return features
-    
     def _normalize(self, value, min_val, max_val, new_min, new_max):
-        """Normalize a value to a new range."""
-        if value < min_val:
-            value = min_val
-        if value > max_val:
-            value = max_val
-            
-        normalized = (value - min_val) / (max_val - min_val) * (new_max - new_min) + new_min
-        return float(normalized)
-    
-    def _convert_numpy_types(self, obj):
-        """Convert NumPy types to Python native types for JSON serialization."""
+        v = np.clip(value, min_val, max_val)
+        return (v - min_val) / (max_val - min_val) * (new_max - new_min) + new_min
+
+    def precompute_base_features(self, file_path: str) -> dict:
+        """Runs all expensive librosa computations once and returns raw features."""
+        y, sr = librosa.load(file_path, sr=self.sample_rate)
+        y_h, y_p = librosa.effects.hpss(y)
+        onset_env = librosa.onset.onset_strength(y=y_p, sr=sr)
+        tempo_raw, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
         
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            return {key: self._convert_numpy_types(value) for key, value in obj.items()}
-        elif isinstance(obj, list):
-            return [self._convert_numpy_types(item) for item in obj]
-        else:
-            return obj
+        # Base features
+        times = librosa.frames_to_time(beats, sr=sr)
+        beat_reg = 1 - min(1., np.std(np.diff(times)) / np.mean(np.diff(times))) if len(times) > 1 else 0.0
+        spec = np.abs(librosa.stft(y))
+        freqs = librosa.fft_frequencies(sr=sr)
+        bass_raw = np.mean(spec[freqs <= 250]) / (np.mean(spec) + 1e-8)
+        pulse_raw = librosa.feature.rms(y=y_p)[0].mean()
+        
+        rms = librosa.feature.rms(y=y)[0]
+        st = np.abs(librosa.stft(y))
+        stn = st / (np.sum(st, axis=0, keepdims=True) + 1e-8)
+        entropy_raw = -np.sum(stn * np.log2(stn + 1e-8), axis=0).mean()
+        dyn_range_raw = np.percentile(rms, 95) / (np.percentile(rms, 10) + 1e-8)
+        
+        centroid_raw = librosa.feature.spectral_centroid(y=y, sr=sr)[0].mean()
+        flatness_raw = librosa.feature.spectral_flatness(y=y).mean()
+        contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+        hr = np.mean(librosa.feature.rms(y=y_h)[0])
+        pr = np.mean(librosa.feature.rms(y=y_p)[0])
+        harmonic_ratio_raw = hr / (hr + pr + 1e-8)
+        contrast_ratio_raw = (contrast[:2].mean() / (contrast[-2:].mean() + 1e-8)) if contrast.shape[0] >= 6 else 0.5
+        
+        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+        mfcc_var_raw = np.var(mfcc[2:8, :], axis=1).mean()
+        pitches, mags = librosa.piptrack(y=y, sr=sr)
+        pmax = np.array([pitches[np.argmax(mags[:, i]), i] for i in range(mags.shape[1]) if mags[:, i].max() > 0])
+        pitch_var_raw = np.std(pmax) / (np.mean(pmax) + 1e-8) if len(pmax) > 0 else 0
+        
+        zcr_raw = librosa.feature.zero_crossing_rate(y=y)[0].mean()
+        mfcc_delta_var_raw = np.var(librosa.feature.delta(mfcc), axis=1).mean()
+        
+        dyn_range_liveness_raw = np.percentile(rms, 95) - np.percentile(rms, 10)
+        high_freq_raw = np.percentile(librosa.feature.spectral_rolloff(y=y, sr=sr)[0], 90)
+        seg = librosa.util.frame(onset_env, frame_length=10, hop_length=1)
+        slope = stats.linregress(np.arange(seg.shape[1]), seg.mean(axis=0))[0] if seg.shape[1] > 1 else 0
+        decay_raw = 1 - self._normalize(abs(slope), 0.001, 0.1, 0, 1)
+
+        chroma = librosa.feature.chroma_cqt(y=y_h, sr=sr, bins_per_octave=36, n_chroma=12)
+        chroma_smooth = np.minimum(1.0, librosa.decompose.nn_filter(chroma, aggregate=np.median, metric='cosine'))
+        key_profile = chroma_smooth.sum(axis=1)
+
+        return {
+            'tempo_raw': tempo_raw, 'beat_reg': beat_reg, 'bass_raw': bass_raw, 'pulse_raw': pulse_raw,
+            'rms_mean': rms.mean(), 'entropy_raw': entropy_raw, 'dyn_range_raw': dyn_range_raw,
+            'harmonic_ratio_raw': harmonic_ratio_raw, 'centroid_raw': centroid_raw, 'flatness_raw': flatness_raw,
+            'contrast_ratio_raw': contrast_ratio_raw, 'onset_env_mean': onset_env.mean(), 'rms_db_mean': librosa.amplitude_to_db(rms, ref=1.0).mean(),
+            'mfcc_var_raw': mfcc_var_raw, 'pitch_var_raw': pitch_var_raw, 'zcr_raw': zcr_raw,
+            'mfcc_delta_var_raw': mfcc_delta_var_raw, 'dyn_range_liveness_raw': dyn_range_liveness_raw,
+            'high_freq_raw': high_freq_raw, 'decay_raw': decay_raw, 'key_profile': key_profile
+        }
+
+    def compute_from_precomputed(self, base_feats: dict) -> dict:
+        """Computes final features from precomputed values using current weights."""
+        w_d = self.weights['danceability']
+        dance = w_d['beat_reg'] * base_feats['beat_reg'] + \
+                w_d['bass'] * base_feats['bass_raw'] + \
+                w_d['pulse'] * self._normalize(base_feats['pulse_raw'], 0, 0.2, 0, 1)
+        
+        w_e = self.weights['energy']
+        energy = w_e['rms'] * self._normalize(base_feats['rms_mean'], 0, 0.2, 0, 1) + \
+                 w_e['entropy'] * self._normalize(base_feats['entropy_raw'], 0, 5, 0, 1) + \
+                 w_e['dyn_range'] * self._normalize(base_feats['dyn_range_raw'], 1, 20, 0, 1)
+
+        w_a = self.weights['acousticness']
+        ac = w_a['harmonic_ratio'] * base_feats['harmonic_ratio_raw'] + \
+             w_a['centroid'] * (1 - self._normalize(base_feats['centroid_raw'], 500, 3000, 0, 1)) + \
+             w_a['flatness'] * (1 - base_feats['flatness_raw']) + \
+             w_a['contrast'] * self._normalize(base_feats['contrast_ratio_raw'], 0.5, 5, 0, 1)
+
+        tempo = float(np.clip(base_feats['tempo_raw'], self.tempo_min, self.tempo_max))
+        w_v = self.weights['valence']
+        val = w_v['mode'] * 0.7 + \
+              w_v['energy'] * energy + \
+              w_v['tempo'] * self._normalize(tempo, self.tempo_min, self.tempo_max, 0, 1) + \
+              w_v['brightness'] * self._normalize(base_feats['centroid_raw'], 500, 3000, 0, 1) + \
+              w_v['rhythm'] * self._normalize(base_feats['onset_env_mean'], 0, 0.5, 0, 1)
+
+        w_i = self.weights['instrumentalness']
+        inst = 1 - (w_i['mfcc_var'] * self._normalize(base_feats['mfcc_var_raw'], 0.1, 5, 0, 1) + \
+                    w_i['pitch_var'] * self._normalize(base_feats['pitch_var_raw'], 0, 0.5, 0, 1))
+
+        w_s = self.weights['speechiness']
+        sp = w_s['zcr'] * self._normalize(base_feats['zcr_raw'], 0.05, 0.15, 0, 1) + \
+             w_s['rhythm'] * (1 - base_feats['beat_reg']) + \
+             w_s['mfcc'] * self._normalize(base_feats['mfcc_delta_var_raw'], 0.5, 5, 0, 1)
+
+        w_l = self.weights['liveness']
+        live = w_l['dyn_range'] * self._normalize(base_feats['dyn_range_liveness_raw'], 0.01, 0.1, 0, 1) + \
+               w_l['high_freq'] * self._normalize(base_feats['high_freq_raw'], 3000, 8000, 0, 1) + \
+               w_l['decay'] * base_feats['decay_raw']
+
+        profile = base_feats['key_profile']
+        profile /= profile.sum() + 1e-8
+        major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+        minor = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+        major /= major.sum(); minor /= minor.sum()
+        cor_maj = [np.corrcoef(profile, np.roll(major, i))[0, 1] for i in range(12)]
+        cor_min = [np.corrcoef(profile, np.roll(minor, i))[0, 1] for i in range(12)]
+        key = int(np.argmax(cor_maj)) if max(cor_maj) > max(cor_min) else int(np.argmax(cor_min))
+
+        return {
+            'danceability': float(np.clip(dance, 0, 1)), 'energy': float(np.clip(energy, 0, 1)),
+            'acousticness': float(np.clip(ac, 0, 1)), 'valence': float(np.clip(val, 0, 1)),
+            'tempo': self.weights['tempo']['scale'] * tempo,
+            'loudness': self.weights['loudness']['scale'] * float(np.clip(base_feats['rms_db_mean'], -60, 0)),
+            'instrumentalness': float(np.clip(inst, 0, 1)), 'speechiness': float(np.clip(sp, 0, 1)),
+            'liveness': float(np.clip(live, 0, 1)), 'key': key
+        }
+
+    def extract_features(self, file_path: str) -> dict:
+        base_feats = self.precompute_base_features(file_path)
+        return self.compute_from_precomputed(base_feats)
+
+    def flatten_weights(self):
+        flat, keys = [], []
+        for feat, sub in self.weights.items():
+            for k, v in sub.items():
+                flat.append(v)
+                keys.append((feat, k))
+        return np.array(flat), keys
+
+    def unflatten_weights(self, flat, keys):
+        new = {}
+        for (feat, k), v in zip(keys, flat):
+            new.setdefault(feat, {})[k] = v
+        self.weights = new
     
     def analyze_track(self, file_path):
         """Analyze a track and return Spotify-like audio features."""
         try:
-            audio = self.load_audio(file_path)
-            features = self.extract_features(audio)
+            features = self.extract_features(file_path)
             return features
         except Exception as e:
             logging.error(f"Error analyzing track: {e}")
             return None
 
-    def save_features_to_cache(self, file_path, features_dict):
+    def save_features_to_cache(self, file_path: str, features_dict):
         row = {"file_path": file_path}
         row.update(features_dict)
 
@@ -885,7 +610,7 @@ class SpotifyFeaturesClone:
         df.to_csv(FEATURE_CACHE, index=False)
         print(f"Saved features for {file_path}")
 
-    def get_features_from_cache(self, file_path):
+    def get_features_from_cache(self, file_path: str):
         if not os.path.exists(FEATURE_CACHE):
             return None
         
@@ -907,10 +632,17 @@ class SoundCloudPipeline:
         self.downloader = YTDLPDownloader(self.download_folder) # Use the new downloader
         self.checkpoint_data = self._load_checkpoint()
         self.song_list = self.get_songs_from_file('./music_info_cleaned.csv', start_index, end_index)
-        self.analyzer = SpotifyFeaturesClone()
+        self.analyzer = SpotifyFeaturesTunable()
         self.downloaded_songs_paths = []
         # Ensure download folder exists
         self.download_folder.mkdir(parents=True, exist_ok=True)
+
+        # Load Spotify ground-truth baseline
+        self.baseline = (
+            pd.read_csv(SPOTIFY_BASELINE)
+              .set_index(['name', 'artist'])
+        )
+
         logging.info(f"Using download folder: {self.download_folder.resolve()}")
         logging.info(f"Using checkpoint file: {self.checkpoint_file.resolve()}")
 
@@ -918,8 +650,9 @@ class SoundCloudPipeline:
     def _load_checkpoint(self):
         """Loads checkpoint data from the JSON file."""
         if self.checkpoint_file.exists():
-            try:
-                with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+            with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+                try:
+                
                     data = json.load(f)
                     logging.info(f"Loaded {len(data)} entries from checkpoint file.")
                     # Compatibility check: Ensure entries have necessary keys
@@ -930,9 +663,9 @@ class SoundCloudPipeline:
                         else:
                             logging.warning(f"Skipping malformed checkpoint entry for URL: {url}")
                     return cleaned_data
-            except (json.JSONDecodeError, IOError) as e:
-                logging.error(f"Error loading checkpoint file {self.checkpoint_file}: {e}. Starting fresh.")
-                return {}
+                except (json.JSONDecodeError, IOError) as e:
+                    logging.error(f"Error loading checkpoint file {self.checkpoint_file}: {e}. Starting fresh.")
+                    return {}
         else:
             logging.info("Checkpoint file not found. Starting fresh.")
             return {}
@@ -964,8 +697,7 @@ class SoundCloudPipeline:
     def get_songs_from_file(self, file_path, start_index=0, end_index=100):
         """Reads a CSV file with song names and artists, and returns a list of dictionaries."""
         df = pd.read_csv(file_path)
-        results = df[['name', 'artist']][start_index:end_index]
-        results = results.drop_duplicates()
+        results = df[['name', 'artist']][start_index:end_index].drop_duplicates()
         return results.to_dict(orient='records')
 
     def process_song(self, song_name, artist_name):
@@ -1027,35 +759,42 @@ class SoundCloudPipeline:
 
         if current_status == 'completed' and output_file and self._is_downloaded(output_file):
             logging.info(f"Checkpoint indicates already downloaded and file exists: '{output_file}'. Skipping.")
-            self.downloaded_songs_paths.append(DOWNLOAD_FOLDER + Path(output_file).name)
+            self.downloaded_songs_paths.append(DOWNLOAD_FOLDER / Path(output_file).name)
             return
 
-        # if current_status == 'failed_ytdlp':
-        #      logging.warning(f"Checkpoint indicates previous yt-dlp download failed for {soundcloud_url}. Skipping.")
-        #      # Optionally add logic here to retry failed downloads after a certain condition
-        #      return
         
         logging.info(f"Attempting download for {soundcloud_url}...")
         
-        # 4. Download using YTDLPDownloader
-        # Pass original names for filename template, downloader might refine based on metadata
-        final_filename, download_successful = self.downloader.download_track(
-            soundcloud_url, 
-            artist_name, 
-            song_name 
+        # Always use dataset's name/artist for filename
+        sanitized_artist = sanitize_filename(artist_name)
+        sanitized_title = sanitize_filename(song_name)
+        final_filename = f"{sanitized_artist} - {sanitized_title}.mp3"
+        final_filepath = self.download_folder / final_filename
+
+        # Check if file already exists
+        if final_filepath.exists():
+            logging.info(f"File already exists: {final_filepath}, skipping download.")
+            self.downloaded_songs_paths.append(final_filepath)
+            # Update checkpoint as completed if not already
+            # (optional: update checkpoint_data here)
+            return
+
+        # Download using YTDLPDownloader, forcing output_path
+        final_filename_str, download_successful = self.downloader.download_track(
+            soundcloud_url,
+            artist_name,
+            song_name,
+            output_path=final_filepath
         )
 
-        # 5. Update Checkpoint based on download result
-        if download_successful and final_filename:
+        if download_successful and final_filename_str:
             existing_entry['download_status'] = 'completed'
-            existing_entry['output_file'] = Path(final_filename).name # Store just the filename
-            self.downloaded_songs_paths.append(DOWNLOAD_FOLDER + Path(final_filename).name)
-
+            existing_entry['output_file'] = Path(final_filename_str).name
+            self.downloaded_songs_paths.append(final_filepath)
         else:
             existing_entry['download_status'] = 'failed_ytdlp'
-            existing_entry['output_file'] = None # Ensure no output file recorded on failure
+            existing_entry['output_file'] = None
             self.downloaded_songs_paths.append("failed")
-        
         self._save_checkpoint()
         logging.info(f"--- Finished processing: '{song_name}' by '{artist_name}' (Status: {existing_entry['download_status']}) ---")
 
@@ -1073,61 +812,181 @@ class SoundCloudPipeline:
                     logging.warning(f"Skipping item {i+1}: Missing 'name' or 'artist'. Data: {song_info}")
                     continue
 
+                logging.info(f"[download_songs] Processing song {i+1}/{len(self.song_list)}: '{song_name}' by '{artist_name}'")
                 self.process_song(song_name, artist_name)
                 total_processed += 1
-                logging.info(f"Completed {total_processed}/{len(self.song_list)}")
+                logging.info(f"[download_songs] Completed {total_processed}/{len(self.song_list)}")
 
         finally:
             # Ensure Selenium driver for scraper is closed when pipeline finishes or errors out
             logging.info("Pipeline run finished. Cleaning up SoundCloudScraper driver...")
             self.scraper._quit_driver()
             logging.info("Cleanup complete.")
+        logging.info("[download_songs] All downloads attempted. Proceeding to next steps.")
 
-    def analyze_songs(self):
-        """Analyzes downloaded songs and compares them to Spotify features."""
+    def save_tuning_csv(self, output_csv: str):
+        """
+        Build a DataFrame of predicted vs. Spotify features for each downloaded song,
+        then append to or create the CSV at output_csv.
+        """
+        logging.info("[save_tuning_csv] Starting feature extraction and CSV saving.")
+        # Collect rows for each song
+        records = []
+        # Build a normalized lookup for the baseline
+        norm_baseline = {(normalize(name), normalize(artist)): row for (name, artist), row in self.baseline.iterrows()}
+        for idx, path in enumerate(self.downloaded_songs_paths):
+            # Skip failed entries
+            if isinstance(path, str):
+                if path == "failed":
+                    continue
+                path = Path(path)
+            basename = path.stem
+            try:
+                artist, title = basename.split(' - ', 1)
+            except ValueError:
+                continue
+            logging.info(f"[save_tuning_csv] ({idx+1}/{len(self.downloaded_songs_paths)}) Extracting features for: '{title}' by '{artist}'")
+            # Extract model predictions
+            feats = self.analyzer.analyze_track(str(path))
+            # Normalize for lookup
+            norm_key = (normalize(title), normalize(artist))
+            obs_row = norm_baseline.get(norm_key)
+            if obs_row is None:
+                logging.warning(f"No baseline entry for: {title} by {artist}, skipping.")
+                continue
+            obs = obs_row.to_dict()
+            row = {'file_path': str(path), 'name': title, 'artist': artist}
+            for feature, val in feats.items():
+                row[feature] = val
+                row[f"{feature}_spotify"] = obs.get(feature)
+            records.append(row)
+        # Create DataFrame and append to CSV
+        df = pd.DataFrame(records)
+        write_header = not os.path.exists(output_csv)
+        df.to_csv(
+            output_csv,
+            mode='a',
+            header=write_header,
+            index=False
+        )
+        action = 'written to' if write_header else 'appended to'
+        logging.info(f"[save_tuning_csv] Tuning data {action} {output_csv} with {len(df)} records.")
+        logging.info("[save_tuning_csv] Feature extraction and CSV saving complete.")
+   
+class HyperparameterTuner:
+    """
+    Optimizes SpotifyFeaturesTunable weights with a train/validation split.
+    """
+    def __init__(
+        self,
+        model,
+        full_baseline_df: pd.DataFrame,
+        val_frac: float = 0.2,
+        seed: int = 42
+    ):
+        """
+        model: an instance of SpotifyFeaturesTunable
+        full_baseline_df: DataFrame with columns 'file_path' plus Spotify ground-truth features
+        val_frac: fraction of data reserved for validation
+        seed: for reproducible train/validation split
+        """
+        self.model = model
+        # Shuffle and split
+        df = full_baseline_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+        split_idx = int(len(df) * (1 - val_frac))
+        train_df = df.iloc[:split_idx]
+        val_df = df.iloc[split_idx:]
+
+        # Index by file_path for easy lookup
+        self.train_baseline = train_df.set_index('file_path')
+        self.val_baseline = val_df.set_index('file_path')
+        self.train_tracks = self.train_baseline.index.tolist()
+        self.val_tracks = self.val_baseline.index.tolist()
+        logging.info(f"[HyperparameterTuner] Initialized with {len(self.train_tracks)} training tracks and {len(self.val_tracks)} validation tracks.")
         
-        if not self.downloaded_songs_paths:
-            self.downloaded_songs_paths = [f"{DOWNLOAD_FOLDER}/{f}" for f in os.listdir(DOWNLOAD_FOLDER) if os.path.isfile(os.path.join(DOWNLOAD_FOLDER, f))]
-
-        total_songs = len(self.downloaded_songs_paths)
-        i=1
-
-        for file_path in self.downloaded_songs_paths:
-            
-            logging.info(f"Analyzing file: {file_path}")
-            if file_path != "failed":
-                if os.path.exists(file_path) and file_path.endswith(".mp3"):
-                    logging.info(f"the file path is: {file_path}")
-                    features = self.analyzer.get_features_from_cache(file_path)
-                    if not features:
-                        results = self.analyzer.analyze_track(file_path)
-                        # Convert NumPy types to Python native types before JSON serialization
-                        json_safe_results = self.analyzer._convert_numpy_types(results)
-                        self.analyzer.save_features_to_cache(file_path, json_safe_results)
-                        features = self.analyzer.get_features_from_cache(file_path)
-                    
-                    # Print results in the specified order
-                    ordered_features = [
-                        "danceability", "energy", "key", "loudness", "mode", 
-                        "speechiness", "acousticness", "instrumentalness", 
-                        "liveness", "valence", "tempo"
-                    ]
-
-                    name_artist = file_path.split("/")[-1]
-                    print(f"this is name_artist: {name_artist}")
-                    artist, song = name_artist[:-4].split(" - ",1)
-
-                    print(f"artist: {artist} and title: {song} .")
-                    # time.sleep(5)
-                    ordered_results = {feature: features.get(feature, "N/A") for feature in ordered_features}
-                    logging.info("we got the results from analyzer, comparing to spotify now")
-                    compare_results(ordered_results, song, artist)
-                    logging.info(f"we got the results from compare_results, {i}/{total_songs} done. Printing the results")
-                    # logging.info(json.dumps(ordered_results, indent=2))
-                    i+=1
-                else:
-                    logging.info(f"File not found: {file_path}")
-        
+        # Pre-compute and cache base features
+        self.feature_cache = {}
+        logging.info("[HyperparameterTuner] Pre-computing base features for all tracks...")
+        all_tracks = self.train_tracks + self.val_tracks
+        for i, fp in enumerate(all_tracks):
+            logging.info(f"[HyperparameterTuner] Pre-computing features for track {i+1}/{len(all_tracks)}: {fp}")
+            self.feature_cache[fp] = self.model.precompute_base_features(fp)
+        logging.info("[HyperparameterTuner] Base feature pre-computation complete.")
 
 
-    
+    def _objective(self, flat_weights):
+        """
+        Objective on training set: mean squared error for continuous features
+        plus classification penalty for key.
+        """
+        # Unpack weights into model
+        _, keys = self.model.flatten_weights()
+        self.model.unflatten_weights(flat_weights, keys)
+
+        errors = []
+        # Continuous feature names
+        cont_feats = [
+            'danceability','energy','acousticness','valence',
+            'tempo','loudness','instrumentalness','speechiness','liveness'
+        ]
+        for fp in self.train_tracks:
+            base_feats = self.feature_cache[fp]
+            pred = self.model.compute_from_precomputed(base_feats)
+            obs = self.train_baseline.loc[fp]
+            # MSE for continuous features
+            for f in cont_feats:
+                errors.append((pred[f] - obs[f])**2)
+            # Key classification penalty
+            key_weight = self.model.weights['key']['weight']
+            errors.append(key_weight * (0 if pred['key']==int(obs['key']) else 1))
+        mean_err = float(np.mean(errors))
+        logging.debug(f"[HyperparameterTuner] Objective evaluated: mean error = {mean_err}")
+        return mean_err
+
+    def tune(self, maxiter: int = 50, popsize: int = 15, tol: float = 1e-5):
+        """
+        Run differential evolution on the training set.
+        Returns the OptimizeResult and logs training loss.
+        """
+        logging.info("[HyperparameterTuner] Starting hyperparameter tuning...")
+        init_vec, _ = self.model.flatten_weights()
+        bounds = [(0.0, 1.0)] * len(init_vec)
+
+        result = differential_evolution(
+            self._objective,
+            bounds,
+            maxiter=maxiter,
+            popsize=popsize,
+            tol=tol
+        )
+        # Apply best weights to model
+        _, keys = self.model.flatten_weights()
+        self.model.unflatten_weights(result.x, keys)
+        logging.info(f"[HyperparameterTuner] Tuning complete. Training loss: {result.fun}")
+        return result
+
+    def validate(self):
+        """
+        Compute and return loss on the validation set using the tuned weights.
+        """
+        logging.info("[HyperparameterTuner] Starting validation on held-out set...")
+        errors = []
+        cont_feats = [
+            'danceability','energy','acousticness','valence',
+            'tempo','loudness','instrumentalness','speechiness','liveness'
+        ]
+        for fp in self.val_tracks:
+            base_feats = self.feature_cache[fp]
+            pred = self.model.compute_from_precomputed(base_feats)
+            obs = self.val_baseline.loc[fp]
+            # MSE for continuous features
+            for f in cont_feats:
+                errors.append((pred[f] - obs[f])**2)
+            # Key penalty
+            key_weight = self.model.weights['key']['weight']
+            errors.append(key_weight * (0 if pred['key']==int(obs['key']) else 1))
+
+        val_loss = float(np.mean(errors))
+        logging.info(f"[HyperparameterTuner] Validation complete. Validation loss: {val_loss}")
+        return val_loss
+

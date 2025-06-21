@@ -8,3 +8,8 @@ comparisons/*
 **/__pycache__/**
 notes.txxt
 .DS_Store
+comparison_analysis.py
+app.py
+audio_features_cache.csv
+tuning_data.csv
+
