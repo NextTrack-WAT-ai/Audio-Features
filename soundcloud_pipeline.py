@@ -1,4 +1,51 @@
+from sklearn.linear_model import LinearRegression
+
+# --- Regression-based Feature Mapping ---
+class FeatureRegressor:
+    """
+    Trains regression models to map extracted raw features to Spotify features.
+    """
+    def __init__(self):
+        self.models = {}
+        self.feature_names = {}
+
+    def fit(self, X_dict, y_dict):
+        """
+        X_dict: dict of {feature_name: 2D np.array of shape (n_samples, n_raw_feats)}
+        y_dict: dict of {feature_name: 1D np.array of shape (n_samples,)}
+        Uses Ridge regression with GridSearchCV to tune alpha for each feature.
+        """
+        from sklearn.linear_model import Ridge
+        from sklearn.model_selection import GridSearchCV
+        param_grid = {'alpha': [0.01, 0.1, 1.0, 10.0, 100.0]}
+        for feat in y_dict:
+            X = X_dict[feat]
+            y = y_dict[feat]
+            ridge = Ridge()
+            grid = GridSearchCV(ridge, param_grid, cv=5, scoring='neg_mean_squared_error')
+            grid.fit(X, y)
+            best_model = grid.best_estimator_
+            self.models[feat] = best_model
+            self.feature_names[feat] = X.shape[1]
+            print(f"[RidgeCV] Best alpha for {feat}: {grid.best_params_['alpha']}")
+
+    def predict(self, feat, X):
+        """
+        Predict a Spotify feature from raw features.
+        feat: feature name (e.g., 'danceability')
+        X: 2D np.array of shape (n_samples, n_raw_feats)
+        """
+        if feat not in self.models:
+            raise ValueError(f"No regressor trained for feature: {feat}")
+        return self.models[feat].predict(X)
+
+    def get_coefficients(self, feat):
+        if feat in self.models:
+            return self.models[feat].coef_, self.models[feat].intercept_
+        return None, None
 import os
+os.environ.setdefault("NUMBA_DISABLE_INTEL_SVML", "1")
+os.environ.setdefault("NUMBA_DISABLE_JIT",  "1")
 import json
 import time
 import logging
@@ -23,6 +70,10 @@ import numpy as np
 from scipy import stats
 import warnings
 from scipy.optimize import differential_evolution
+from scipy.optimize import minimize
+import joblib
+from sklearn.preprocessing import StandardScaler
+import traceback
 
 # --- Configuration ---
 DOWNLOAD_FOLDER = Path("downloads")
@@ -331,6 +382,7 @@ class YTDLPDownloader:
                 'logger': logging.getLogger('yt-dlp'),
                 'noprogress': True,
                 'noplaylist': True,
+                'ffmpeg_location': 'C:\\ProgramData\\chocolatey\\bin',
                  # Add cookie file if needed for restricted content (requires browser addon like Get cookies.txt LOCALLY)
                  # 'cookiefile': 'path/to/your/cookies.txt',
             }
@@ -452,61 +504,239 @@ class SpotifyFeaturesTunable:
 
     def precompute_base_features(self, file_path: str) -> dict:
         """Runs all expensive librosa computations once and returns raw features."""
-        y, sr = librosa.load(file_path, sr=self.sample_rate)
-        y_h, y_p = librosa.effects.hpss(y)
-        onset_env = librosa.onset.onset_strength(y=y_p, sr=sr)
-        tempo_raw, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-        
-        # Base features
-        times = librosa.frames_to_time(beats, sr=sr)
-        beat_reg = 1 - min(1., np.std(np.diff(times)) / np.mean(np.diff(times))) if len(times) > 1 else 0.0
-        spec = np.abs(librosa.stft(y))
-        freqs = librosa.fft_frequencies(sr=sr)
-        bass_raw = np.mean(spec[freqs <= 250]) / (np.mean(spec) + 1e-8)
-        pulse_raw = librosa.feature.rms(y=y_p)[0].mean()
-        
-        rms = librosa.feature.rms(y=y)[0]
-        st = np.abs(librosa.stft(y))
-        stn = st / (np.sum(st, axis=0, keepdims=True) + 1e-8)
-        entropy_raw = -np.sum(stn * np.log2(stn + 1e-8), axis=0).mean()
-        dyn_range_raw = np.percentile(rms, 95) / (np.percentile(rms, 10) + 1e-8)
-        
-        centroid_raw = librosa.feature.spectral_centroid(y=y, sr=sr)[0].mean()
-        flatness_raw = librosa.feature.spectral_flatness(y=y).mean()
-        contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
-        hr = np.mean(librosa.feature.rms(y=y_h)[0])
-        pr = np.mean(librosa.feature.rms(y=y_p)[0])
-        harmonic_ratio_raw = hr / (hr + pr + 1e-8)
-        contrast_ratio_raw = (contrast[:2].mean() / (contrast[-2:].mean() + 1e-8)) if contrast.shape[0] >= 6 else 0.5
-        
-        mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
-        mfcc_var_raw = np.var(mfcc[2:8, :], axis=1).mean()
-        pitches, mags = librosa.piptrack(y=y, sr=sr)
-        pmax = np.array([pitches[np.argmax(mags[:, i]), i] for i in range(mags.shape[1]) if mags[:, i].max() > 0])
-        pitch_var_raw = np.std(pmax) / (np.mean(pmax) + 1e-8) if len(pmax) > 0 else 0
-        
-        zcr_raw = librosa.feature.zero_crossing_rate(y=y)[0].mean()
-        mfcc_delta_var_raw = np.var(librosa.feature.delta(mfcc), axis=1).mean()
-        
-        dyn_range_liveness_raw = np.percentile(rms, 95) - np.percentile(rms, 10)
-        high_freq_raw = np.percentile(librosa.feature.spectral_rolloff(y=y, sr=sr)[0], 90)
-        seg = librosa.util.frame(onset_env, frame_length=10, hop_length=1)
-        slope = stats.linregress(np.arange(seg.shape[1]), seg.mean(axis=0))[0] if seg.shape[1] > 1 else 0
-        decay_raw = 1 - self._normalize(abs(slope), 0.001, 0.1, 0, 1)
+        try:
+            # ------------------------------------------------------------
+            # 1.  Load & harmonic/percussive separation
+            # ------------------------------------------------------------
+            y, sr = librosa.load(file_path, sr=self.sample_rate)
+            y = np.ascontiguousarray(y, dtype=np.float32)
 
-        chroma = librosa.feature.chroma_cqt(y=y_h, sr=sr, bins_per_octave=36, n_chroma=12)
-        chroma_smooth = np.minimum(1.0, librosa.decompose.nn_filter(chroma, aggregate=np.median, metric='cosine'))
-        key_profile = chroma_smooth.sum(axis=1)
+            # If y is stereo (multi-channel), convert to mono
+            if y.ndim > 1:
+                y = np.mean(y, axis=0)
+            y_h, y_p = librosa.effects.hpss(y)
+            onset_env = librosa.onset.onset_strength(y=y_p, sr=sr)
 
-        return {
-            'tempo_raw': tempo_raw, 'beat_reg': beat_reg, 'bass_raw': bass_raw, 'pulse_raw': pulse_raw,
-            'rms_mean': rms.mean(), 'entropy_raw': entropy_raw, 'dyn_range_raw': dyn_range_raw,
-            'harmonic_ratio_raw': harmonic_ratio_raw, 'centroid_raw': centroid_raw, 'flatness_raw': flatness_raw,
-            'contrast_ratio_raw': contrast_ratio_raw, 'onset_env_mean': onset_env.mean(), 'rms_db_mean': librosa.amplitude_to_db(rms, ref=1.0).mean(),
-            'mfcc_var_raw': mfcc_var_raw, 'pitch_var_raw': pitch_var_raw, 'zcr_raw': zcr_raw,
-            'mfcc_delta_var_raw': mfcc_delta_var_raw, 'dyn_range_liveness_raw': dyn_range_liveness_raw,
-            'high_freq_raw': high_freq_raw, 'decay_raw': decay_raw, 'key_profile': key_profile
-        }
+            # ------------------------------------------------------------
+            # 2.  Tempo & beat regularity
+            # ------------------------------------------------------------
+            try:
+                tempo_raw, beats = librosa.beat.beat_track(y=y_p, sr=sr)
+            except TypeError:
+                tempo_raw = librosa.beat.tempo(y=y_p, sr=sr)[0]
+                beats = []
+            times = librosa.frames_to_time(beats, sr=sr)
+            if len(times) > 1:
+                diffs     = np.diff(times)
+                beat_reg  = 1.0 - min(1.0, np.std(diffs) / (np.mean(diffs) + 1e-8))
+            else:
+                beat_reg  = 0.0
+
+            # ------------------------------------------------------------
+            # 3.  RMS / spectrum-level descriptors
+            # ------------------------------------------------------------
+            spec        = np.abs(librosa.stft(y))
+            freqs       = librosa.fft_frequencies(sr=sr)
+            mean_spec   = float(np.mean(spec) + 1e-8)
+
+            bass_spec   = spec[freqs <= 250]
+            bass_raw    = float(np.mean(bass_spec) / mean_spec) if bass_spec.size else 0.0
+            pulse_raw   = float(librosa.feature.rms(y=y_p)[0].mean())
+
+            rms         = librosa.feature.rms(y=y)[0]
+            entropy_raw = float((-np.sum((spec / (spec.sum(axis=0, keepdims=True)+1e-8)) *
+                            np.log2((spec / (spec.sum(axis=0, keepdims=True)+1e-8))+1e-8), axis=0)).mean())
+            p95, p10    = np.percentile(rms, 95), np.percentile(rms, 10)
+            dyn_range_raw = float(p95 / (p10 + 1e-8))
+
+            centroid_raw   = float(librosa.feature.spectral_centroid(y=y, sr=sr)[0].mean())
+            flatness_arr   = librosa.feature.spectral_flatness(y=y)
+            flatness_raw   = float(flatness_arr.mean())
+            flatness_var   = float(np.var(flatness_arr))
+
+            contrast       = librosa.feature.spectral_contrast(y=y, sr=sr)
+            if contrast.shape[0] >= 6:
+                low_mean  = float(np.mean(contrast[:2]))
+                high_mean = float(np.mean(contrast[-2:]))
+                contrast_ratio_raw = low_mean / (high_mean + 1e-8)
+            else:
+                contrast_ratio_raw = 0.5   # fallback
+
+            # ------------------------------------------------------------
+            # 4.  Harmonic / Percussive & MFCC stats
+            # ------------------------------------------------------------
+            hr = float(librosa.feature.rms(y=y_h)[0].mean())
+            pr = float(librosa.feature.rms(y=y_p)[0].mean())
+            harmonic_ratio_raw            = hr / (hr + pr + 1e-8)
+            harmonic_to_percussive_ratio  = hr / (pr + 1e-8)
+
+            mfcc          = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+            mfcc_var_raw  = float(np.var(mfcc[2:8, :], axis=1).mean())
+            mfcc_means    = np.mean(mfcc[1:4, :], axis=1)      # 3-element vector
+
+            mfcc_delta_var_raw = float(np.var(librosa.feature.delta(mfcc), axis=1).mean())
+
+            try:
+                pitches, mags = librosa.piptrack(y=y, sr=sr)
+                pmax_list = []
+                for i in range(mags.shape[1]):
+                    mag = mags[:, i]
+                    if np.any(mag > 0):
+                        pitch_val = pitches[np.argmax(mag), i]
+                        pmax_list.append(pitch_val)
+                pmax = np.array(pmax_list)
+                pitch_var_raw = np.std(pmax) / (np.mean(pmax) + 1e-8) if len(pmax) > 0 else 0.0
+            except Exception as e:
+                logging.warning("piptrack failed for %s: %s", file_path, e)
+                pitch_var_raw = 0.0
+            # ------------------------------------------------------------
+            # 5.  Zero-crossing & additional timbre features
+            # ------------------------------------------------------------
+            # 5-a)  GLOBAL ZCR  (already OK)
+            zero_crossings = int(np.sum(np.abs(np.diff(np.sign(y)))) / 2)
+            zcr_raw        = zero_crossings / len(y)
+
+            # 5-b)  PER-FRAME ZCR → variance
+            # Frame the signal (same defaults librosa would use)
+            FRAME_LEN   = 2048
+            HOP_LEN     = 512
+            frames      = librosa.util.frame(y, frame_length=FRAME_LEN,
+                                            hop_length=HOP_LEN)
+
+            # Count zero-crossings in each column (= one frame)
+            frame_zc = (np.abs(np.diff(np.sign(frames), axis=0)) > 0).sum(axis=0)
+            zcr_per_frame = frame_zc / FRAME_LEN          # normalise
+            zcr_var       = float(np.var(zcr_per_frame))
+
+
+            spectral_rolloff      = librosa.feature.spectral_rolloff(y=y, sr=sr)[0]
+            spectral_rolloff_50   = float(np.percentile(spectral_rolloff, 50))
+            high_freq_raw         = float(np.percentile(spectral_rolloff, 90))
+            spectral_bandwidth    = float(np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]))
+
+            # ------------------------------------------------------------
+            # 6.  Mid-band energy
+            # ------------------------------------------------------------
+            mid_mask          = (freqs >= 300) & (freqs <= 3400)
+            mid_band          = spec[mid_mask, :]
+            mid_band_energy   = float(np.mean(mid_band) / mean_spec) if mid_band.size else 0.0
+
+            # ------------------------------------------------------------
+            # 7.  Liveness / decay & onset rate
+            # ------------------------------------------------------------
+            dyn_range_liveness_raw = float(np.percentile(rms, 95) - np.percentile(rms, 10))
+
+            seg         = librosa.util.frame(onset_env, frame_length=10, hop_length=1)
+            slope       = float(stats.linregress(np.arange(seg.shape[1]), seg.mean(axis=0))[0]) if seg.shape[1] > 1 else 0.0
+            decay_raw   = 1.0 - self._normalize(abs(slope), 0.001, 0.1, 0, 1)   # ensure scalar
+
+            onset_frames = librosa.onset.onset_detect(y=y_p, sr=sr)
+            duration_sec = float(librosa.get_duration(y=y, sr=sr))
+            onset_rate   = len(onset_frames) / duration_sec if duration_sec > 0 else 0.0
+
+            # ------------------------------------------------------------
+            # 8.  Key profile
+            # ------------------------------------------------------------
+            chroma = librosa.feature.chroma_cqt(
+                y=y_h, sr=sr, bins_per_octave=36, n_chroma=12, tuning=0.0
+            )
+            chroma_smooth    = np.minimum(1.0,
+                                librosa.decompose.nn_filter(chroma,
+                                                            aggregate=np.median,
+                                                            metric='cosine'))
+            key_profile      = chroma_smooth.sum(axis=1).tolist()
+
+            # ------------------------------------------------------------
+            # 9. Extra features for acousticness & speechiness tuning
+            # ------------------------------------------------------------
+
+            low_freq_energy = np.mean(spec[freqs <= 2000])  # rolloff proxy
+            rolloff_ratio = float(low_freq_energy / (np.mean(spec) + 1e-8))
+
+            spec_norm = spec / (spec.sum(axis=0, keepdims=True) + 1e-8)
+            spec_entropy = -np.sum(spec_norm * np.log2(spec_norm + 1e-8), axis=0)
+            spectral_entropy_mean = float(np.mean(spec_entropy))
+            S_harm = np.abs(librosa.stft(y_h))
+            hbr = float(np.mean(S_harm) / (np.mean(spec) + 1e-8))
+            S_perc = np.abs(librosa.stft(y_p))
+            percussive_ratio = float(np.mean(S_perc) / (np.mean(spec) + 1e-8))
+
+            # Spectral flux (measures changes in spectrum — sharp in speech, smoother in instruments)
+            spectral_flux = librosa.onset.onset_strength(y=y, sr=sr)
+            spectral_flux_mean = float(np.mean(spectral_flux))
+            spectral_flux_var  = float(np.var(spectral_flux))
+
+            # Delta MFCC mean
+            mfcc_delta = librosa.feature.delta(mfcc)
+            mfcc_delta_mean = float(np.mean(mfcc_delta))
+
+            # Spectral rolloff at 90th percentile
+            spectral_rolloff_90 = float(np.percentile(librosa.feature.spectral_rolloff(y=y, sr=sr)[0], 90))
+
+            # Spectral bandwidth variance
+            spectral_bandwidth_vals = librosa.feature.spectral_bandwidth(y=y, sr=sr)[0]
+            spectral_bandwidth_var = float(np.var(spectral_bandwidth_vals))
+
+            # Spectral flatness variance (already computed flatness_arr earlier)
+            spectral_flatness_var = float(np.var(flatness_arr))
+
+            # Optional (if you want to try estimating harmonic-to-noise ratio)
+            hnr = 0.0
+            try:
+                S_full, _ = librosa.magphase(librosa.stft(y))
+                S_harm, S_perc = librosa.decompose.hpss(S_full)
+                noise_est = np.abs(S_full - S_harm)
+                hnr = float(np.mean(S_harm) / (np.mean(noise_est) + 1e-8))
+            except Exception as e:
+                logging.warning("HNR computation failed for %s: %s", file_path, e)
+
+            # ------------------------------------------------------------
+            # 10.  Assemble & return
+            # ------------------------------------------------------------
+            return {
+                # rhythm / dynamics
+                'tempo_raw': tempo_raw, 'beat_reg': beat_reg, 'pulse_raw': pulse_raw,
+                'rms_mean': float(rms.mean()), 'entropy_raw': entropy_raw,
+                'dyn_range_raw': dyn_range_raw, 'dyn_range_liveness_raw': dyn_range_liveness_raw,
+                'onset_env_mean': float(onset_env.mean()), 'onset_rate': onset_rate,
+                # spectrum / timbre
+                'bass_raw': bass_raw, 'centroid_raw': centroid_raw, 'flatness_raw': flatness_raw,
+                'contrast_ratio_raw': contrast_ratio_raw, 'spectral_rolloff_50': spectral_rolloff_50,
+                'spectral_bandwidth': spectral_bandwidth, 'flatness_var': flatness_var,
+                'high_freq_raw': high_freq_raw, 'mid_band_energy': mid_band_energy,
+                # MFCC / pitch
+                'mfcc_var_raw': mfcc_var_raw, 'mfcc_mean_1': mfcc_means[0],
+                'mfcc_mean_2': mfcc_means[1], 'mfcc_mean_3': mfcc_means[2],
+                'mfcc_delta_var_raw': mfcc_delta_var_raw,
+                'pitch_var_raw': pitch_var_raw,
+                # harmonic / percussive
+                'harmonic_ratio_raw': harmonic_ratio_raw,
+                'harmonic_to_percussive_ratio': harmonic_to_percussive_ratio,
+                # ZCR
+                'zcr_raw': zcr_raw, 'zcr_var': zcr_var,
+                # loudness-proxy
+                'rms_db_mean': float(librosa.amplitude_to_db(rms, ref=1.0).mean()),
+                # decay
+                'decay_raw': decay_raw,
+                # key profile
+                'key_profile': key_profile,
+                # Acousticness / Speechiness tuning
+                'spectral_flux_mean': spectral_flux_mean,
+                'spectral_flux_var': spectral_flux_var,
+                'mfcc_delta_mean': mfcc_delta_mean,
+                'spectral_rolloff_90': spectral_rolloff_90,
+                'spectral_bandwidth_var': spectral_bandwidth_var,
+                'spectral_flatness_var': spectral_flatness_var,
+                'harmonic_to_noise_ratio': hnr,
+                'acoustic_ratio': hbr,
+                'percussive_ratio': percussive_ratio,
+                'rolloff_ratio': rolloff_ratio,
+                'spectral_entropy': spectral_entropy_mean,
+            }
+
+        except Exception as e:
+            raise
+
 
     def compute_from_precomputed(self, base_feats: dict) -> dict:
         """Computes final features from precomputed values using current weights."""
@@ -636,7 +866,18 @@ class SoundCloudPipeline:
         self.downloaded_songs_paths = []
         # Ensure download folder exists
         self.download_folder.mkdir(parents=True, exist_ok=True)
-
+        self.feature_map = {
+            "danceability": ["beat_reg", "bass_raw", "pulse_raw"],
+            "energy": ["rms_mean", "entropy_raw", "dyn_range_raw"],
+            "acousticness": ["harmonic_ratio_raw", "centroid_raw", "flatness_raw", "contrast_ratio_raw"],
+            "valence": ["onset_env_mean", "centroid_raw", "rms_mean", "entropy_raw", "high_freq_raw", "decay_raw", "mfcc_mean_raw"],
+            "tempo": ["tempo_raw", "rms_db_mean"],
+            "loudness": ["rms_db_mean", "entropy_raw"],
+            "instrumentalness": ["mfcc_var_raw", "pitch_var_raw"],
+            "speechiness": ["zcr_raw", "mfcc_delta_var_raw"],
+            "liveness": ["dyn_range_liveness_raw", "high_freq_raw", "decay_raw", "zcr_raw"],
+            "key": ["key_profile"],
+        }
         # Load Spotify ground-truth baseline
         self.baseline = (
             pd.read_csv(SPOTIFY_BASELINE)
@@ -707,12 +948,21 @@ class SoundCloudPipeline:
         # Checkpoint logic: Find existing entry based on song/artist name
         soundcloud_url = None
         existing_entry = None
-        for url, data in self.checkpoint_data.items():
-            if data.get('song_name', '').lower() == song_name.lower() and \
-               data.get('artist_name', '').lower() == artist_name.lower():
+        for url, data in list(self.checkpoint_data.items()):
+            # ── Upgrade old-format rows (“ok”, “failed_*”) to dicts ─────────
+            if isinstance(data, str):
+                logging.debug("Upgrading legacy checkpoint entry for %s (%s)", url, data)
+                data = {"download_status": data}
+                self.checkpoint_data[url] = data          # mutate in-memory
+                self._save_checkpoint()                   # persist upgrade
+
+            # Now `data` is guaranteed to be a dict
+            if data.get("song_name", "").lower() == song_name.lower() and \
+            data.get("artist_name", "").lower() == artist_name.lower():
                 soundcloud_url = url
                 existing_entry = data
-                logging.info(f"Found existing entry in checkpoint for '{song_name}' - URL: {soundcloud_url}")
+                logging.info("Found existing entry in checkpoint for '%s' - URL: %s",
+                            song_name, soundcloud_url)
                 break
 
         if not soundcloud_url:
@@ -798,195 +1048,329 @@ class SoundCloudPipeline:
         self._save_checkpoint()
         logging.info(f"--- Finished processing: '{song_name}' by '{artist_name}' (Status: {existing_entry['download_status']}) ---")
 
-    def download_songs(self):
-        """Runs the pipeline for a list of songs."""
-        logging.info(f"Starting pipeline for {len(self.song_list)} songs...")
-        total_processed = 0
-        logging.info("Song list in download_songs:\n " + str(self.song_list[:10]))
-        try:
-            for i, song_info in enumerate(self.song_list):
-                song_name = song_info.get('name')
-                artist_name = song_info.get('artist')
+    def download_songs(self, skip_failed: bool = True) -> None:
+        # Ensure self.checkpoint alias exists
+        if not hasattr(self, "checkpoint"):
+            self.checkpoint = getattr(self, "checkpoint_data", {})
+        """Download every song in ``self.song_list`` unless it has already been
+        processed (or previously failed when ``skip_failed`` is True).
+        A `checkpoint` dict maps ``"{title} - {artist}"`` to a status string::
 
-                if not song_name or not artist_name:
-                    logging.warning(f"Skipping item {i+1}: Missing 'name' or 'artist'. Data: {song_info}")
-                    continue
+            "ok"                → downloaded successfully
+            "failed_ytdlp"      → youtube‑dl/yt‑dlp failure
+            "failed_runtime"    → other exception (network, parsing, etc.)
+        """
+        logging.info(f"Starting pipeline for {len(self.song_list)} songs…")
+        processed = 0
+        logging.info("First song in song_list: %r", self.song_list[0])
+        logging.info("Type of first song: %s", type(self.song_list[0]))
+        for i, song in enumerate(self.song_list, 1):
+            title = song.get("name")
+            artist = song.get("artist")
+            if not title or not artist:
+                logging.warning("Skipping row %d: missing title/artist → %s", i, song)
+                continue
 
-                logging.info(f"[download_songs] Processing song {i+1}/{len(self.song_list)}: '{song_name}' by '{artist_name}'")
-                self.process_song(song_name, artist_name)
-                total_processed += 1
-                logging.info(f"[download_songs] Completed {total_processed}/{len(self.song_list)}")
+            key = f"{title} - {artist}"
+            status = self.checkpoint.get(key)
+            if skip_failed and status and status.startswith("failed"):
+                logging.info("[download_songs] Skipping previously failed: %s", key)
+                continue
+            if status == "ok":
+                logging.info("[download_songs] Already downloaded: %s", key)
+                continue
 
-        finally:
-            # Ensure Selenium driver for scraper is closed when pipeline finishes or errors out
-            logging.info("Pipeline run finished. Cleaning up SoundCloudScraper driver...")
-            self.scraper._quit_driver()
-            logging.info("Cleanup complete.")
+                        # Skip if any failed download artifacts exist (.opus or .part)
+            sanitized_key = key.replace("/", "-").replace("\\", "-")
+            opus_files = list(self.download_folder.glob(f"{sanitized_key}*.opus"))
+            part_files = list(self.download_folder.glob(f"{sanitized_key}*.part"))
+            if opus_files or part_files:
+                logging.info("[download_songs] Skipping due to existing failed artifacts for: %s", key)
+                self.checkpoint[key] = "failed_file"
+                continue
+
+            logging.info("[download_songs] Processing %d/%d: '%s' by '%s'", i, len(self.song_list), title, artist)
+            try:
+                self.process_song(title, artist)  # implements download+convert
+                self.checkpoint[key] = "ok"
+            except Exception as e:
+                logging.warning("Download failed for '%s' (%s) → %s", key, type(e).__name__, e)
+                print(traceback.format_exc())
+                self.checkpoint[key] = "failed_runtime"
+            finally:
+                processed += 1
+                logging.info("[download_songs] Completed %d/%d", processed, len(self.song_list))
+
+        # --- always close Selenium/driver -----------------------------------
+        logging.info("Pipeline run finished. Cleaning up SoundCloudScraper driver…")
+        self.scraper._quit_driver()
+        logging.info("Cleanup complete.")
         logging.info("[download_songs] All downloads attempted. Proceeding to next steps.")
 
-    def save_tuning_csv(self, output_csv: str):
-        """
-        Build a DataFrame of predicted vs. Spotify features for each downloaded song,
-        then append to or create the CSV at output_csv.
-        """
+    def save_tuning_csv(self, output_csv: str) -> None:
         logging.info("[save_tuning_csv] Starting feature extraction and CSV saving.")
-        # Collect rows for each song
         records = []
-        # Build a normalized lookup for the baseline
-        norm_baseline = {(normalize(name), normalize(artist)): row for (name, artist), row in self.baseline.iterrows()}
-        for idx, path in enumerate(self.downloaded_songs_paths):
-            # Skip failed entries
-            if isinstance(path, str):
-                if path == "failed":
-                    continue
-                path = Path(path)
-            basename = path.stem
+
+        # Build normalized lookup for Spotify baseline features
+        norm_baseline = {
+            (normalize(n), normalize(a)): row for (n, a), row in self.baseline.iterrows()
+        }
+
+        # Extract features for all downloaded songs
+        for idx, path in enumerate(self.downloaded_songs_paths, 1):
+            if isinstance(path, str) and path.startswith("failed"):
+                continue
+            path = Path(path)
+
             try:
-                artist, title = basename.split(' - ', 1)
+                artist, title = path.stem.split(" - ", 1)
             except ValueError:
+                logging.warning("Filename not in 'Artist - Title' format: %s", path.name)
                 continue
-            logging.info(f"[save_tuning_csv] ({idx+1}/{len(self.downloaded_songs_paths)}) Extracting features for: '{title}' by '{artist}'")
-            # Extract model predictions
-            feats = self.analyzer.analyze_track(str(path))
-            # Normalize for lookup
-            norm_key = (normalize(title), normalize(artist))
-            obs_row = norm_baseline.get(norm_key)
-            if obs_row is None:
-                logging.warning(f"No baseline entry for: {title} by {artist}, skipping.")
+
+            logging.info("[save_tuning_csv] (%d/%d) Extracting: '%s' by '%s'", idx, len(self.downloaded_songs_paths), title, artist)
+            try:
+                feats = self.analyzer.analyze_track(str(path))
+                base_feats = self.analyzer.precompute_base_features(str(path))
+            except Exception as e:
+                logging.warning("Feature extraction failed for '%s' by '%s' → %s", title, artist, e)
                 continue
-            obs = obs_row.to_dict()
-            row = {'file_path': str(path), 'name': title, 'artist': artist}
-            for feature, val in feats.items():
-                row[feature] = val
-                row[f"{feature}_spotify"] = obs.get(feature)
+
+            baseline_row = norm_baseline.get((normalize(title), normalize(artist)))
+            if baseline_row is None:
+                logging.warning("No baseline entry for '%s' by '%s' — skipping.", title, artist)
+                continue
+
+            row = {
+                "file_path": str(path),
+                "name": title,
+                "artist": artist,
+            }
+            # Add predicted features + Spotify baseline
+            print("All feature names extracted:", feats.keys())
+            for feat_name, pred_val in feats.items():
+                row[feat_name] = pred_val
+                row[f"{feat_name}_spotify"] = baseline_row.get(feat_name)
+
+            # Add raw features, flatten key_profile
+            for k, v in base_feats.items():
+                if k == "key_profile":
+                    for i, elem in enumerate(v):
+                        row[f"key_profile_{i}"] = float(elem)
+                else:
+                    # handle NaNs robustly
+                    try:
+                        row[k] = float(v)
+                    except Exception:
+                        row[k] = np.nan
+
             records.append(row)
-        # Create DataFrame and append to CSV
+
+        if not records:
+            logging.warning("No features extracted — CSV not updated.")
+            return
+
         df = pd.DataFrame(records)
-        write_header = not os.path.exists(output_csv)
-        df.to_csv(
-            output_csv,
-            mode='a',
-            header=write_header,
-            index=False
-        )
-        action = 'written to' if write_header else 'appended to'
-        logging.info(f"[save_tuning_csv] Tuning data {action} {output_csv} with {len(df)} records.")
-        logging.info("[save_tuning_csv] Feature extraction and CSV saving complete.")
-   
-class HyperparameterTuner:
-    """
-    Optimizes SpotifyFeaturesTunable weights with a train/validation split.
-    """
-    def __init__(
-        self,
-        model,
-        full_baseline_df: pd.DataFrame,
-        val_frac: float = 0.2,
-        seed: int = 42
-    ):
-        """
-        model: an instance of SpotifyFeaturesTunable
-        full_baseline_df: DataFrame with columns 'file_path' plus Spotify ground-truth features
-        val_frac: fraction of data reserved for validation
-        seed: for reproducible train/validation split
-        """
-        self.model = model
-        # Shuffle and split
-        df = full_baseline_df.sample(frac=1, random_state=seed).reset_index(drop=True)
-        split_idx = int(len(df) * (1 - val_frac))
-        train_df = df.iloc[:split_idx]
-        val_df = df.iloc[split_idx:]
-
-        # Index by file_path for easy lookup
-        self.train_baseline = train_df.set_index('file_path')
-        self.val_baseline = val_df.set_index('file_path')
-        self.train_tracks = self.train_baseline.index.tolist()
-        self.val_tracks = self.val_baseline.index.tolist()
-        logging.info(f"[HyperparameterTuner] Initialized with {len(self.train_tracks)} training tracks and {len(self.val_tracks)} validation tracks.")
         
-        # Pre-compute and cache base features
-        self.feature_cache = {}
-        logging.info("[HyperparameterTuner] Pre-computing base features for all tracks...")
-        all_tracks = self.train_tracks + self.val_tracks
-        for i, fp in enumerate(all_tracks):
-            logging.info(f"[HyperparameterTuner] Pre-computing features for track {i+1}/{len(all_tracks)}: {fp}")
-            self.feature_cache[fp] = self.model.precompute_base_features(fp)
-        logging.info("[HyperparameterTuner] Base feature pre-computation complete.")
+        # Optional: Impute NaNs here or drop
+        df.fillna(df.mean(numeric_only=True), inplace=True)
+
+        # Save CSV
+        df.to_csv(output_csv, index=False)
+        logging.info("[save_tuning_csv] Tuning data written to %s with %d records.", output_csv, len(df))
+
+        # Save feature scalers per target for inference (optional but recommended)
+        # Example: save scalers for features used in regression models
+        for tgt, raw_feats in self.feature_map.items():
+            try:
+                feat_cols = []
+                if tgt == "key":
+                    feat_cols = [f"key_profile_{i}" for i in range(12)]
+                else:
+                    feat_cols = raw_feats
+                feat_data = df[feat_cols].to_numpy()
+                # Remove rows with NaNs for scaler fitting
+                mask = ~np.isnan(feat_data).any(axis=1)
+                scaler = StandardScaler().fit(feat_data[mask])
+                joblib.dump(scaler, f"scalers/scaler_{tgt}.joblib")
+            except Exception as e:
+                logging.warning("Failed to save scaler for %s: %s", tgt, e)
+   
+# class HyperparameterTuner:
+#     """
+#     Optimizes SpotifyFeaturesTunable weights with a train/validation split.
+#     """
+#     def __init__(
+#         self,
+#         model,
+#         full_baseline_df: pd.DataFrame,
+#         val_frac: float = 0.2,
+#         seed: int = 42
+#     ):
+#         """
+#         model: an instance of SpotifyFeaturesTunable
+#         full_baseline_df: DataFrame with columns 'file_path' plus Spotify ground-truth features
+#         val_frac: fraction of data reserved for validation
+#         seed: for reproducible train/validation split
+#         """
+#         self.model = model
+#         # Shuffle and split
+#         df = full_baseline_df.sample(frac=1, random_state=seed).reset_index(drop=True)
+#         split_idx = int(len(df) * (1 - val_frac))
+#         train_df = df.iloc[:split_idx]
+#         val_df = df.iloc[split_idx:]
+
+#         # Index by file_path for easy lookup
+#         self.train_baseline = train_df.set_index('file_path')
+#         self.val_baseline = val_df.set_index('file_path')
+#         self.train_tracks = self.train_baseline.index.tolist()
+#         self.val_tracks = self.val_baseline.index.tolist()
+#         logging.info(f"[HyperparameterTuner] Initialized with {len(self.train_tracks)} training tracks and {len(self.val_tracks)} validation tracks.")
+        
+#         # Pre-compute and cache base features
+#         self.feature_cache = {}
+#         logging.info("[HyperparameterTuner] Pre-computing base features for all tracks...")
+#         all_tracks = self.train_tracks + self.val_tracks
+#         for i, fp in enumerate(all_tracks):
+#             logging.info(f"[HyperparameterTuner] Pre-computing features for track {i+1}/{len(all_tracks)}: {fp}")
+#             self.feature_cache[fp] = self.model.precompute_base_features(fp)
+#         logging.info("[HyperparameterTuner] Base feature pre-computation complete.")
 
 
-    def _objective(self, flat_weights):
-        """
-        Objective on training set: mean squared error for continuous features
-        plus classification penalty for key.
-        """
-        # Unpack weights into model
-        _, keys = self.model.flatten_weights()
-        self.model.unflatten_weights(flat_weights, keys)
+#     def _objective(self, flat_weights):
+#         """
+#         Objective on training set: mean squared error for continuous features
+#         plus classification penalty for key.
+#         """
+#         # Unpack weights into model
+#         _, keys = self.model.flatten_weights()
+#         self.model.unflatten_weights(flat_weights, keys)
 
-        errors = []
-        # Continuous feature names
-        cont_feats = [
-            'danceability','energy','acousticness','valence',
-            'tempo','loudness','instrumentalness','speechiness','liveness'
-        ]
-        for fp in self.train_tracks:
-            base_feats = self.feature_cache[fp]
-            pred = self.model.compute_from_precomputed(base_feats)
-            obs = self.train_baseline.loc[fp]
-            # MSE for continuous features
-            for f in cont_feats:
-                errors.append((pred[f] - obs[f])**2)
-            # Key classification penalty
-            key_weight = self.model.weights['key']['weight']
-            errors.append(key_weight * (0 if pred['key']==int(obs['key']) else 1))
-        mean_err = float(np.mean(errors))
-        logging.debug(f"[HyperparameterTuner] Objective evaluated: mean error = {mean_err}")
-        return mean_err
+#         errors = []
+#         # Continuous feature names
+#         cont_feats = [
+#             'danceability','energy','acousticness','valence',
+#             'tempo','loudness','instrumentalness','speechiness','liveness'
+#         ]
+#         for fp in self.train_tracks:
+#             base_feats = self.feature_cache[fp]
+#             pred = self.model.compute_from_precomputed(base_feats)
+#             obs = self.train_baseline.loc[fp]
+#             # MSE for continuous features
+#             for f in cont_feats:
+#                 errors.append((pred[f] - obs[f])**2)
+#             # Key classification penalty
+#             key_weight = self.model.weights['key']['weight']
+#             errors.append(key_weight * (0 if pred['key']==int(obs['key']) else 1))
+#         mean_err = float(np.mean(errors))
+#         logging.debug(f"[HyperparameterTuner] Objective evaluated: mean error = {mean_err}")
+#         # Debug: print current weights and error
+#         print("[DEBUG] Current weights in objective:")
+#         print(self.model.weights)
+#         print(f"[DEBUG] Current mean error: {mean_err}")
+#         return mean_err
 
-    def tune(self, maxiter: int = 50, popsize: int = 15, tol: float = 1e-5):
-        """
-        Run differential evolution on the training set.
-        Returns the OptimizeResult and logs training loss.
-        """
-        logging.info("[HyperparameterTuner] Starting hyperparameter tuning...")
-        init_vec, _ = self.model.flatten_weights()
-        bounds = [(0.0, 1.0)] * len(init_vec)
+#     def tune(self, maxiter: int = 50, tol: float = 1e-5):
+#         """
+#         Run a faster optimizer (L-BFGS-B) on the training set.
+#         Returns the OptimizeResult and logs training loss.
+#         """
+#         logging.info("[HyperparameterTuner] Starting hyperparameter tuning with L-BFGS-B...")
+#         init_vec, _ = self.model.flatten_weights()
+#         bounds = [(0.0, 1.0)] * len(init_vec)
 
-        result = differential_evolution(
-            self._objective,
-            bounds,
-            maxiter=maxiter,
-            popsize=popsize,
-            tol=tol
-        )
-        # Apply best weights to model
-        _, keys = self.model.flatten_weights()
-        self.model.unflatten_weights(result.x, keys)
-        logging.info(f"[HyperparameterTuner] Tuning complete. Training loss: {result.fun}")
-        return result
+#         result = minimize(
+#             self._objective,
+#             init_vec,
+#             method='L-BFGS-B',
+#             bounds=bounds,
+#             options={'maxiter': maxiter, 'ftol': tol, 'disp': True}
+#         )
+#         # Apply best weights to model
+#         _, keys = self.model.flatten_weights()
+#         self.model.unflatten_weights(result.x, keys)
+#         logging.info(f"[HyperparameterTuner] Tuning complete. Training loss: {result.fun}")
+#         print("[DEBUG] Optimization result:")
+#         print(result)
+#         print("[DEBUG] Best weights after tuning:")
+#         print(self.model.weights)
+#         return result
 
-    def validate(self):
-        """
-        Compute and return loss on the validation set using the tuned weights.
-        """
-        logging.info("[HyperparameterTuner] Starting validation on held-out set...")
-        errors = []
-        cont_feats = [
-            'danceability','energy','acousticness','valence',
-            'tempo','loudness','instrumentalness','speechiness','liveness'
-        ]
-        for fp in self.val_tracks:
-            base_feats = self.feature_cache[fp]
-            pred = self.model.compute_from_precomputed(base_feats)
-            obs = self.val_baseline.loc[fp]
-            # MSE for continuous features
-            for f in cont_feats:
-                errors.append((pred[f] - obs[f])**2)
-            # Key penalty
-            key_weight = self.model.weights['key']['weight']
-            errors.append(key_weight * (0 if pred['key']==int(obs['key']) else 1))
+#     def validate(self):
+#         """
+#         Compute and return loss on the validation set using the tuned weights.
+#         """
+#         logging.info("[HyperparameterTuner] Starting validation on held-out set...")
+#         errors = []
+#         cont_feats = [
+#             'danceability','energy','acousticness','valence',
+#             'tempo','loudness','instrumentalness','speechiness','liveness'
+#         ]
+#         for fp in self.val_tracks:
+#             base_feats = self.feature_cache[fp]
+#             pred = self.model.compute_from_precomputed(base_feats)
+#             obs = self.val_baseline.loc[fp]
+#             # MSE for continuous features
+#             for f in cont_feats:
+#                 errors.append((pred[f] - obs[f])**2)
+#             # Key penalty
+#             key_weight = self.model.weights['key']['weight']
+#             errors.append(key_weight * (0 if pred['key']==int(obs['key']) else 1))
 
-        val_loss = float(np.mean(errors))
-        logging.info(f"[HyperparameterTuner] Validation complete. Validation loss: {val_loss}")
-        return val_loss
+#         val_loss = float(np.mean(errors))
+#         print(f"[DEBUG] Validation loss: {val_loss}")
+#         logging.info(f"[HyperparameterTuner] Validation complete. Validation loss: {val_loss}")
+#         return val_loss
+
+import numpy as np
+from sklearn.base import BaseEstimator, RegressorMixin
+
+class ClippedRegressor(BaseEstimator, RegressorMixin):
+    def __init__(self, base_regressor, low=0.0, high=1.0):
+        self.base_regressor = base_regressor
+        self.low = low
+        self.high = high
+
+    def fit(self, X, y, **kwargs):
+        self.base_regressor.fit(X, y, **kwargs)
+        # mark as fitted for sklearn's check_is_fitted logic
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def predict(self, X):
+        return np.clip(self.base_regressor.predict(X), self.low, self.high)
+
+
+class LogTransformedRegressor(BaseEstimator, RegressorMixin):
+    def __init__(self, base_regressor, clip_min=1e-6):
+        self.base_regressor = base_regressor
+        self.clip_min = clip_min
+
+    def fit(self, X, y, **kwargs):
+        safe_y = np.clip(y, a_min=self.clip_min, a_max=None)
+        self.base_regressor.fit(X, np.log1p(safe_y), **kwargs)
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def predict(self, X):
+        return np.expm1(self.base_regressor.predict(X))
+
+
+class CyclicKeyRegressor(BaseEstimator, RegressorMixin):
+    def __init__(self, base_regressor):
+        self.base_regressor = base_regressor
+
+    def fit(self, X, y, **kwargs):
+        y_cos = np.cos(2 * np.pi * y / 12)
+        y_sin = np.sin(2 * np.pi * y / 12)
+        Y = np.column_stack([y_cos, y_sin])
+        self.base_regressor.fit(X, Y, **kwargs)
+        self.n_features_in_ = X.shape[1]
+        return self
+
+    def predict(self, X):
+        pred = self.base_regressor.predict(X)
+        angles = np.arctan2(pred[:, 1], pred[:, 0])
+        keys = (np.round(angles * 12 / (2 * np.pi)) % 12).astype(int)
+        return keys
 
