@@ -106,7 +106,7 @@ def extract_features():
                     logging.info(f"{tgt:<15} Prediction: {pred_val:.4f}  |  Truth: N/A")
                 else:
                     try:
-                        diff = abs(pred_val - float(true_val))
+                        diff = np.sqrt((pred_val - float(true_val)) ** 2)
                         logging.info(f"{tgt:<15} Prediction: {pred_val:.4f}  |  Truth: {true_val:.4f}  |  Δ = {diff:.4f}")
                     except Exception:
                         logging.info(f"{tgt:<15} Prediction: {pred_val}  |  Truth: {true_val} (non-numeric)")

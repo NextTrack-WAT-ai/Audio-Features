@@ -203,7 +203,6 @@ def build_pipeline(target):
         max_depth = tuned.get("max_depth", 5)
         learning_rate = tuned.get("learning_rate", 0.05)
     else:
-        # Your current default logic
         if target in {"tempo", "loudness"}:
             n_estimators = 250
             max_depth = 5

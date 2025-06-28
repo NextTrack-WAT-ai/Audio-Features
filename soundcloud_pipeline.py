@@ -476,27 +476,11 @@ class SpotifyFeaturesTunable:
         self,
         sample_rate: int = 22050,
         tempo_range: tuple = (60.0, 180.0),
-        weights: dict = None
     ):
         self.sample_rate = sample_rate
         self.tempo_min, self.tempo_max = tempo_range
         warnings.filterwarnings('ignore')
         logging.basicConfig(level=logging.INFO)
-
-        # Default tunable weights
-        default = {
-            'danceability':     {'beat_reg': 0.4, 'bass': 0.3, 'pulse': 0.3},
-            'energy':           {'rms': 0.6, 'entropy': 0.2, 'dyn_range': 0.2},
-            'acousticness':     {'harmonic_ratio': 0.4, 'centroid': 0.3, 'flatness': 0.2, 'contrast': 0.1},
-            'valence':          {'mode': 0.3, 'energy': 0.2, 'tempo': 0.2, 'brightness': 0.15, 'rhythm': 0.15},
-            'instrumentalness': {'mfcc_var': 0.6, 'pitch_var': 0.4},
-            'speechiness':      {'zcr': 0.4, 'rhythm': 0.3, 'mfcc': 0.3},
-            'liveness':         {'dyn_range': 0.4, 'high_freq': 0.3, 'decay': 0.3},
-            'tempo':            {'scale': 1.0},
-            'loudness':         {'scale': 1.0},
-            'key':              {'weight': 1.0}
-        }
-        self.weights = weights or default
 
     def _normalize(self, value, min_val, max_val, new_min, new_max):
         v = np.clip(value, min_val, max_val)
@@ -737,82 +721,9 @@ class SpotifyFeaturesTunable:
         except Exception as e:
             raise
 
-
-    def compute_from_precomputed(self, base_feats: dict) -> dict:
-        """Computes final features from precomputed values using current weights."""
-        w_d = self.weights['danceability']
-        dance = w_d['beat_reg'] * base_feats['beat_reg'] + \
-                w_d['bass'] * base_feats['bass_raw'] + \
-                w_d['pulse'] * self._normalize(base_feats['pulse_raw'], 0, 0.2, 0, 1)
-        
-        w_e = self.weights['energy']
-        energy = w_e['rms'] * self._normalize(base_feats['rms_mean'], 0, 0.2, 0, 1) + \
-                 w_e['entropy'] * self._normalize(base_feats['entropy_raw'], 0, 5, 0, 1) + \
-                 w_e['dyn_range'] * self._normalize(base_feats['dyn_range_raw'], 1, 20, 0, 1)
-
-        w_a = self.weights['acousticness']
-        ac = w_a['harmonic_ratio'] * base_feats['harmonic_ratio_raw'] + \
-             w_a['centroid'] * (1 - self._normalize(base_feats['centroid_raw'], 500, 3000, 0, 1)) + \
-             w_a['flatness'] * (1 - base_feats['flatness_raw']) + \
-             w_a['contrast'] * self._normalize(base_feats['contrast_ratio_raw'], 0.5, 5, 0, 1)
-
-        tempo = float(np.clip(base_feats['tempo_raw'], self.tempo_min, self.tempo_max))
-        w_v = self.weights['valence']
-        val = w_v['mode'] * 0.7 + \
-              w_v['energy'] * energy + \
-              w_v['tempo'] * self._normalize(tempo, self.tempo_min, self.tempo_max, 0, 1) + \
-              w_v['brightness'] * self._normalize(base_feats['centroid_raw'], 500, 3000, 0, 1) + \
-              w_v['rhythm'] * self._normalize(base_feats['onset_env_mean'], 0, 0.5, 0, 1)
-
-        w_i = self.weights['instrumentalness']
-        inst = 1 - (w_i['mfcc_var'] * self._normalize(base_feats['mfcc_var_raw'], 0.1, 5, 0, 1) + \
-                    w_i['pitch_var'] * self._normalize(base_feats['pitch_var_raw'], 0, 0.5, 0, 1))
-
-        w_s = self.weights['speechiness']
-        sp = w_s['zcr'] * self._normalize(base_feats['zcr_raw'], 0.05, 0.15, 0, 1) + \
-             w_s['rhythm'] * (1 - base_feats['beat_reg']) + \
-             w_s['mfcc'] * self._normalize(base_feats['mfcc_delta_var_raw'], 0.5, 5, 0, 1)
-
-        w_l = self.weights['liveness']
-        live = w_l['dyn_range'] * self._normalize(base_feats['dyn_range_liveness_raw'], 0.01, 0.1, 0, 1) + \
-               w_l['high_freq'] * self._normalize(base_feats['high_freq_raw'], 3000, 8000, 0, 1) + \
-               w_l['decay'] * base_feats['decay_raw']
-
-        profile = base_feats['key_profile']
-        profile /= profile.sum() + 1e-8
-        major = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-        minor = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
-        major /= major.sum(); minor /= minor.sum()
-        cor_maj = [np.corrcoef(profile, np.roll(major, i))[0, 1] for i in range(12)]
-        cor_min = [np.corrcoef(profile, np.roll(minor, i))[0, 1] for i in range(12)]
-        key = int(np.argmax(cor_maj)) if max(cor_maj) > max(cor_min) else int(np.argmax(cor_min))
-
-        return {
-            'danceability': float(np.clip(dance, 0, 1)), 'energy': float(np.clip(energy, 0, 1)),
-            'acousticness': float(np.clip(ac, 0, 1)), 'valence': float(np.clip(val, 0, 1)),
-            'tempo': self.weights['tempo']['scale'] * tempo,
-            'loudness': self.weights['loudness']['scale'] * float(np.clip(base_feats['rms_db_mean'], -60, 0)),
-            'instrumentalness': float(np.clip(inst, 0, 1)), 'speechiness': float(np.clip(sp, 0, 1)),
-            'liveness': float(np.clip(live, 0, 1)), 'key': key
-        }
-
     def extract_features(self, file_path: str) -> dict:
         base_feats = self.precompute_base_features(file_path)
         return self.compute_from_precomputed(base_feats)
-
-    def flatten_weights(self):
-        flat, keys = [], []
-        for feat, sub in self.weights.items():
-            for k, v in sub.items():
-                flat.append(v)
-                keys.append((feat, k))
-        return np.array(flat), keys
-
-    def unflatten_weights(self, flat, keys):
-        new = {}
-        for (feat, k), v in zip(keys, flat):
-            new.setdefault(feat, {})[k] = v
-        self.weights = new
     
     def analyze_track(self, file_path):
         """Analyze a track and return Spotify-like audio features."""
@@ -1195,132 +1106,6 @@ class SoundCloudPipeline:
                 joblib.dump(scaler, f"scalers/scaler_{tgt}.joblib")
             except Exception as e:
                 logging.warning("Failed to save scaler for %s: %s", tgt, e)
-   
-# class HyperparameterTuner:
-#     """
-#     Optimizes SpotifyFeaturesTunable weights with a train/validation split.
-#     """
-#     def __init__(
-#         self,
-#         model,
-#         full_baseline_df: pd.DataFrame,
-#         val_frac: float = 0.2,
-#         seed: int = 42
-#     ):
-#         """
-#         model: an instance of SpotifyFeaturesTunable
-#         full_baseline_df: DataFrame with columns 'file_path' plus Spotify ground-truth features
-#         val_frac: fraction of data reserved for validation
-#         seed: for reproducible train/validation split
-#         """
-#         self.model = model
-#         # Shuffle and split
-#         df = full_baseline_df.sample(frac=1, random_state=seed).reset_index(drop=True)
-#         split_idx = int(len(df) * (1 - val_frac))
-#         train_df = df.iloc[:split_idx]
-#         val_df = df.iloc[split_idx:]
-
-#         # Index by file_path for easy lookup
-#         self.train_baseline = train_df.set_index('file_path')
-#         self.val_baseline = val_df.set_index('file_path')
-#         self.train_tracks = self.train_baseline.index.tolist()
-#         self.val_tracks = self.val_baseline.index.tolist()
-#         logging.info(f"[HyperparameterTuner] Initialized with {len(self.train_tracks)} training tracks and {len(self.val_tracks)} validation tracks.")
-        
-#         # Pre-compute and cache base features
-#         self.feature_cache = {}
-#         logging.info("[HyperparameterTuner] Pre-computing base features for all tracks...")
-#         all_tracks = self.train_tracks + self.val_tracks
-#         for i, fp in enumerate(all_tracks):
-#             logging.info(f"[HyperparameterTuner] Pre-computing features for track {i+1}/{len(all_tracks)}: {fp}")
-#             self.feature_cache[fp] = self.model.precompute_base_features(fp)
-#         logging.info("[HyperparameterTuner] Base feature pre-computation complete.")
-
-
-#     def _objective(self, flat_weights):
-#         """
-#         Objective on training set: mean squared error for continuous features
-#         plus classification penalty for key.
-#         """
-#         # Unpack weights into model
-#         _, keys = self.model.flatten_weights()
-#         self.model.unflatten_weights(flat_weights, keys)
-
-#         errors = []
-#         # Continuous feature names
-#         cont_feats = [
-#             'danceability','energy','acousticness','valence',
-#             'tempo','loudness','instrumentalness','speechiness','liveness'
-#         ]
-#         for fp in self.train_tracks:
-#             base_feats = self.feature_cache[fp]
-#             pred = self.model.compute_from_precomputed(base_feats)
-#             obs = self.train_baseline.loc[fp]
-#             # MSE for continuous features
-#             for f in cont_feats:
-#                 errors.append((pred[f] - obs[f])**2)
-#             # Key classification penalty
-#             key_weight = self.model.weights['key']['weight']
-#             errors.append(key_weight * (0 if pred['key']==int(obs['key']) else 1))
-#         mean_err = float(np.mean(errors))
-#         logging.debug(f"[HyperparameterTuner] Objective evaluated: mean error = {mean_err}")
-#         # Debug: print current weights and error
-#         print("[DEBUG] Current weights in objective:")
-#         print(self.model.weights)
-#         print(f"[DEBUG] Current mean error: {mean_err}")
-#         return mean_err
-
-#     def tune(self, maxiter: int = 50, tol: float = 1e-5):
-#         """
-#         Run a faster optimizer (L-BFGS-B) on the training set.
-#         Returns the OptimizeResult and logs training loss.
-#         """
-#         logging.info("[HyperparameterTuner] Starting hyperparameter tuning with L-BFGS-B...")
-#         init_vec, _ = self.model.flatten_weights()
-#         bounds = [(0.0, 1.0)] * len(init_vec)
-
-#         result = minimize(
-#             self._objective,
-#             init_vec,
-#             method='L-BFGS-B',
-#             bounds=bounds,
-#             options={'maxiter': maxiter, 'ftol': tol, 'disp': True}
-#         )
-#         # Apply best weights to model
-#         _, keys = self.model.flatten_weights()
-#         self.model.unflatten_weights(result.x, keys)
-#         logging.info(f"[HyperparameterTuner] Tuning complete. Training loss: {result.fun}")
-#         print("[DEBUG] Optimization result:")
-#         print(result)
-#         print("[DEBUG] Best weights after tuning:")
-#         print(self.model.weights)
-#         return result
-
-#     def validate(self):
-#         """
-#         Compute and return loss on the validation set using the tuned weights.
-#         """
-#         logging.info("[HyperparameterTuner] Starting validation on held-out set...")
-#         errors = []
-#         cont_feats = [
-#             'danceability','energy','acousticness','valence',
-#             'tempo','loudness','instrumentalness','speechiness','liveness'
-#         ]
-#         for fp in self.val_tracks:
-#             base_feats = self.feature_cache[fp]
-#             pred = self.model.compute_from_precomputed(base_feats)
-#             obs = self.val_baseline.loc[fp]
-#             # MSE for continuous features
-#             for f in cont_feats:
-#                 errors.append((pred[f] - obs[f])**2)
-#             # Key penalty
-#             key_weight = self.model.weights['key']['weight']
-#             errors.append(key_weight * (0 if pred['key']==int(obs['key']) else 1))
-
-#         val_loss = float(np.mean(errors))
-#         print(f"[DEBUG] Validation loss: {val_loss}")
-#         logging.info(f"[HyperparameterTuner] Validation complete. Validation loss: {val_loss}")
-#         return val_loss
 
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
